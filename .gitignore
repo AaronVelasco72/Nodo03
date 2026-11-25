@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+# Datos de ejecución: base SQLite, llaves privadas y zips. NUNCA subirlos al repositorio.
+datos/
+datos-*/
+src/Nodo03.Web/datos/
+TestResults/

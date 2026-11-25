@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Nodo03.Core
+    ===========
+    Biblioteca SIN dependencias externas (ningún paquete NuGet) que contiene
+    todo lo que es independiente de la interfaz:
+      * Protocolo/  -> manifest.json, nomenclatura del .zip, empaquetado y validación.
+      * Cripto/     -> identidad X.509 del nodo, cifradores RSA y ECC, firma, hashes.
+      * Datos/      -> base de datos SQLite (vía P/Invoke a la librería nativa del sistema).
+      * Servicios/  -> casos de uso que combinan lo anterior (armar / abrir paquetes).
+
+    Se mantiene sin dependencias para que compile en cualquier máquina con el SDK
+    de .NET 8, incluso sin acceso a internet (útil en el laboratorio).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Nodo03.Core</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Necesario para el puente P/Invoke de SQLite (Datos/Sqlite.cs). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+</Project>

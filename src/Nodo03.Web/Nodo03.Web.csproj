@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!--
+    Nodo03.Web
+    ===========
+    El nodo en ejecución: servidor HTTP (Kestrel) que
+      * expone el protocolo del grupo   -> GET /api/status, POST /api/requests/receive
+      * expone la API local de la UI     -> /api/local/...
+      * sirve la interfaz web            -> wwwroot/ (HTML + CSS + JS sin frameworks)
+    Solo usa el framework compartido Microsoft.AspNetCore.App (incluido en el SDK):
+    no requiere descargar paquetes NuGet.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Nodo03.Web</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Nombre del ejecutable al publicar: Nodo03.exe -->
+    <AssemblyName>Nodo03</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nodo03.Core\Nodo03.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copia la interfaz junto al ejecutable para que funcione desde cualquier carpeta. -->
+    <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Permite que el proyecto de pruebas use clases 'internal' si hiciera falta. -->
+    <InternalsVisibleTo Include="Nodo03.Pruebas" />
+  </ItemGroup>
+
+</Project>

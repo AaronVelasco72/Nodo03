@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Nodo03.Pruebas
+    ==============
+    Pruebas automatizadas con xUnit. Ejecutar desde la raíz:   dotnet test
+      Unitarias/     una clase a la vez, sin red ni disco compartido
+      Integracion/   nodos REALES (Kestrel en puertos aleatorios de 127.0.0.1) hablando por HTTP
+      Concurrencia/  muchas peticiones/operaciones simultáneas para buscar condiciones de carrera
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Para usar WebApplication/HttpClient del nodo dentro de las pruebas de integración. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\src\Nodo03.Core\Nodo03.Core.csproj" />
+    <ProjectReference Include="..\..\src\Nodo03.Web\Nodo03.Web.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>
