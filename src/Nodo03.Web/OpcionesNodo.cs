@@ -3,99 +3,100 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using Nodo03.Core.Protocolo;
 
 namespace Nodo03.Web;
 
 /// <summary>
-/// Configuración de arranque del nodo (sección "Nodo" de appsettings.json).
-/// Cualquier valor se puede sobreescribir desde la línea de comandos, por ejemplo:
-/// <code>dotnet run --project src/Nodo03.Web -- --Nodo:Puerto=5001 --Nodo:CarpetaDatos=datos/b</code>
+/// Configuración del nodo (sección "Nodo" de appsettings.json). Se puede cambiar por línea de comandos:
+/// <code>dotnet run --project src/Nodo03.Web -- --Nodo:Equipo=3 --Nodo:Puerto=5003</code>
 /// </summary>
 public sealed class OpcionesNodo
 {
-    /// <summary>Id del nodo; aparece en manifest.sourceNode y en el nombre del zip (sin guion).</summary>
-    public string NodoId { get; set; } = "NODO-03";
+    /// <summary>Número de equipo (1–99). Define el nodeId (EQ03) y el puerto (5003).</summary>
+    public int Equipo { get; set; } = 3;
 
-    /// <summary>Interfaz donde escucha Kestrel. "0.0.0.0" = todas (necesario para la LAN).</summary>
+    /// <summary>nodeId del estándar v2.0: "EQ" + equipo a 2 dígitos.</summary>
+    public string NodoId => Identificadores.NodoDeEquipo(Equipo);
+
+    /// <summary>Interfaz de escucha. El estándar exige 0.0.0.0 (sección 5.1).</summary>
     public string Escucha { get; set; } = "0.0.0.0";
 
-    /// <summary>Puerto HTTP. La propuesta recomienda 5000 u 8080. 0 = puerto libre aleatorio (pruebas).</summary>
-    public int Puerto { get; set; } = 5000;
+    /// <summary>Puerto HTTP. Vacío = 5000 + número de equipo (5003). 0 = libre (pruebas).</summary>
+    public int? Puerto { get; set; }
 
-    /// <summary>
-    /// "IP:Puerto" que se anuncia en manifest.sourceIp. Vacío = se detecta la IP de la LAN.
-    /// Útil si la máquina tiene varias tarjetas de red y se detecta la equivocada.
-    /// </summary>
-    public string DireccionPublica { get; set; } = "";
+    public int PuertoEfectivo => Puerto ?? 5000 + Equipo;
 
-    /// <summary>Carpeta de datos (base SQLite, llaves, zips). Relativa al directorio actual.</summary>
+    /// <summary>IP que se anuncia (sourceIp y beacon). Vacío = se detecta la IP de la LAN.</summary>
+    public string IpPublica { get; set; } = "";
+
     public string CarpetaDatos { get; set; } = "datos";
-
-    /// <summary>Contraseña con la que se cifran las llaves privadas en disco.</summary>
     public string ContrasenaLlaves { get; set; } = "cambia-esta-contrasena-equipo3";
-
-    /// <summary>Tamaño máximo del .zip recibido, en MB (la propuesta recomienda 50).</summary>
     public int LimiteZipMb { get; set; } = 50;
-
-    /// <summary>
-    /// Si es false (recomendado), la API de administración /api/local solo responde a
-    /// peticiones desde la misma máquina. Así otro equipo de la LAN NO puede aceptar,
-    /// rechazar ni descifrar nuestras solicitudes. Se puede encender desde Ajustes para
-    /// manejar el nodo desde el celular.
-    /// </summary>
     public bool AdminRemoto { get; set; }
 
-    /// <summary>Límite en bytes.</summary>
-    public long LimiteZipBytes => LimiteZipMb * 1024L * 1024L;
+    /// <summary>Anuncio UDP de descubrimiento (sección 6.1).</summary>
+    public bool Descubrimiento { get; set; } = true;
+    public int PuertoUdp { get; set; } = 5099;
+    public int IntervaloAnuncioSegundos { get; set; } = 30;
 
-    /// <summary>Ruta absoluta de la carpeta de datos.</summary>
+    /// <summary>Destinos extra del anuncio (ej. "127.0.0.1" para probar varios nodos en una sola PC).</summary>
+    public string[] DestinosAnuncioExtra { get; set; } = [];
+
+    /// <summary>Tope síncrono de /api/crypto/* antes de responder 202 con jobId (10.6).</summary>
+    public int TopeSincronoSegundos { get; set; } = 30;
+
+    public long LimiteZipBytes => LimiteZipMb * 1024L * 1024L;
     public string RutaDatos => Path.GetFullPath(CarpetaDatos);
 }
 
-/// <summary>
-/// Sabe cuál es la dirección "IP:Puerto" de este nodo para ponerla en manifest.sourceIp.
-/// </summary>
+/// <summary>IP y puerto con los que este nodo se presenta a los demás.</summary>
 public sealed class DireccionPropia(OpcionesNodo opciones, IServer servidor)
 {
-    /// <summary>"IP:Puerto" que los demás nodos usan para responder.</summary>
-    public string Obtener()
+    /// <summary>"IP:puerto" para sourceIp.</summary>
+    public string Obtener() => $"{Ip()}:{PuertoReal()}";
+
+    public string Ip()
     {
-        if (!string.IsNullOrWhiteSpace(opciones.DireccionPublica)) return opciones.DireccionPublica.Trim();
-        var ip = opciones.Escucha is "127.0.0.1" or "localhost" ? "127.0.0.1" : IpLan() ?? "127.0.0.1";
-        return $"{ip}:{PuertoReal()}";
+        if (!string.IsNullOrWhiteSpace(opciones.IpPublica)) return opciones.IpPublica.Trim();
+        if (opciones.Escucha is "127.0.0.1" or "localhost") return "127.0.0.1";
+        return Interfaces().FirstOrDefault().Ip?.ToString() ?? "127.0.0.1";
     }
 
-    /// <summary>Puerto en el que de verdad quedó escuchando Kestrel (importa cuando se pidió el 0).</summary>
+    /// <summary>Puerto real de Kestrel (importa cuando se pidió el 0).</summary>
     public int PuertoReal()
     {
-        var direcciones = servidor.Features.Get<IServerAddressesFeature>()?.Addresses;
-        var primera = direcciones?.FirstOrDefault();
-        return primera is not null && Uri.TryCreate(primera.Replace("0.0.0.0", "localhost").Replace("[::]", "localhost"),
-            UriKind.Absolute, out var u) ? u.Port : opciones.Puerto;
+        var primera = servidor.Features.Get<IServerAddressesFeature>()?.Addresses.FirstOrDefault();
+        return primera is not null && Uri.TryCreate(primera.Replace("0.0.0.0", "localhost").Replace("[::]", "localhost"), UriKind.Absolute, out var u)
+            ? u.Port : opciones.PuertoEfectivo;
     }
 
     /// <summary>
-    /// IPv4 de la LAN: la primera tarjeta activa, que no sea loopback ni virtual, y que
-    /// tenga puerta de enlace (eso descarta adaptadores de VirtualBox/WSL sin salida).
+    /// Interfaces IPv4 activas con su broadcast de subred (para el anuncio UDP). Primero las que
+    /// tienen puerta de enlace (descarta adaptadores virtuales sin salida).
     /// </summary>
-    public static string? IpLan()
+    public static List<(IPAddress Ip, IPAddress Broadcast)> Interfaces()
     {
+        var lista = new List<(IPAddress, IPAddress, bool)>();
         try
         {
-            var candidatas = NetworkInterface.GetAllNetworkInterfaces()
-                .Where(n => n.OperationalStatus == OperationalStatus.Up &&
-                            n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-                .Select(n => (n, p: n.GetIPProperties()))
-                .Select(x => (x.n, x.p,
-                    ip: x.p.UnicastAddresses.FirstOrDefault(a => a.Address.AddressFamily == AddressFamily.InterNetwork)?.Address))
-                .Where(x => x.ip is not null && !IPAddress.IsLoopback(x.ip))
-                .OrderByDescending(x => x.p.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork))
-                .ToList();
-            return candidatas.FirstOrDefault().ip?.ToString();
+            foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (n.OperationalStatus != OperationalStatus.Up || n.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                var props = n.GetIPProperties();
+                var conGateway = props.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork);
+                foreach (var u in props.UnicastAddresses)
+                {
+                    if (u.Address.AddressFamily != AddressFamily.InterNetwork || IPAddress.IsLoopback(u.Address)) continue;
+                    var ip = u.Address.GetAddressBytes();
+                    var mascara = (u.IPv4Mask ?? IPAddress.Parse("255.255.255.0")).GetAddressBytes();
+                    var bc = new byte[4];
+                    for (var i = 0; i < 4; i++) bc[i] = (byte)(ip[i] | ~mascara[i]);
+                    lista.Add((u.Address, new IPAddress(bc), conGateway));
+                }
+            }
         }
-        catch (NetworkInformationException)
-        {
-            return null;
-        }
+        catch (NetworkInformationException) { }
+        return lista.OrderByDescending(x => x.Item3).Select(x => (x.Item1, x.Item2)).ToList();
     }
 }

@@ -4,8 +4,10 @@ namespace Nodo03.Web.Servicios;
 /// Guarda los .zip en disco. Estructura:
 /// <code>
 /// datos/paquetes/recibidos/  zips que pasaron la validación
-/// datos/paquetes/invalidos/  zips que fallaron SHA-256 o firma (se conservan como evidencia)
-/// datos/paquetes/enviados/   zips generados por este nodo
+/// datos/paquetes/invalidos/  zips que fallaron hash, firma, certificado o tiempo (evidencia)
+/// datos/paquetes/generados/  zips producidos por forward (propios o delegados)
+/// datos/paquetes/resultados/ zips result devueltos por un inverse
+/// datos/paquetes/enviados/   copias reempaquetadas (9.6) que se mandaron a otras bandejas
 /// </code>
 /// El nombre en disco lleva un prefijo único (<c>id__nombre.zip</c>) porque dos nodos
 /// distintos podrían mandar zips con el mismo nombre.
@@ -17,11 +19,11 @@ public sealed class AlmacenPaquetes
     public AlmacenPaquetes(OpcionesNodo opciones)
     {
         _raiz = Path.Combine(opciones.RutaDatos, "paquetes");
-        foreach (var c in new[] { "recibidos", "invalidos", "enviados" })
+        foreach (var c in new[] { "recibidos", "invalidos", "generados", "resultados", "enviados" })
             Directory.CreateDirectory(Path.Combine(_raiz, c));
     }
 
-    /// <summary>Guarda y devuelve la ruta. <paramref name="carpeta"/> = recibidos | invalidos | enviados.</summary>
+    /// <summary>Guarda y devuelve la ruta. <paramref name="carpeta"/> = recibidos | invalidos | generados | resultados | enviados.</summary>
     public string Guardar(string carpeta, string id, string nombreZip, byte[] bytes)
     {
         var ruta = Path.Combine(_raiz, carpeta, $"{id}__{NombreSeguro(nombreZip)}");

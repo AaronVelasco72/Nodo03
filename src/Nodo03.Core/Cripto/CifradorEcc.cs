@@ -1,128 +1,79 @@
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using System.Text.Json.Nodes;
-using Nodo03.Core.Protocolo;
 
 namespace Nodo03.Core.Cripto;
 
 /// <summary>
-/// Cifrado de curva elíptica ECIES sobre P-256. Algoritmo #6 de la tabla, código <c>ECC</c>.
+/// Algoritmo #6 <c>ECC</c> (dueño: EQ03). Esquema ECIES sobre la curva P-256.
 /// </summary>
 /// <remarks>
-/// <para>Las curvas elípticas no "cifran" directamente como RSA: lo que hacen es ponerse de
-/// acuerdo en un secreto (ECDH). ECIES combina tres piezas:</para>
-/// <list type="number">
-///   <item><b>ECDH efímero.</b> El emisor genera un par de llaves P-256 NUEVO para este
-///   paquete. Multiplica su privada efímera por la pública del destinatario y obtiene un
-///   punto secreto compartido. El destinatario obtiene el MISMO punto multiplicando su
-///   privada por la pública efímera (que viaja en el manifiesto).
-///   Matemáticamente: <c>e·(d·G) = d·(e·G)</c>.</item>
-///   <item><b>HKDF-SHA256.</b> Convierte la coordenada X del punto compartido en una llave
-///   AES de 32 bytes con buena distribución.</item>
-///   <item><b>AES-256-GCM.</b> Cifra los datos y genera un tag que detecta alteraciones.</item>
-/// </list>
-///
-/// <para>Como la llave efímera cambia en cada envío, cifrar dos veces el mismo mensaje da
-/// resultados distintos y comprometer un paquete no compromete los demás.</para>
-///
-/// <para>Formato en el manifiesto (para que otro lenguaje lo reproduzca):</para>
 /// <code>
-/// "publicParameters": {
-///   "scheme": "ECIES-P256-HKDF-SHA256-AES-256-GCM",
-///   "curve": "P-256",
-///   "ephemeralPublicKeyBase64": "...", // SubjectPublicKeyInfo DER de la llave efímera
-///   "kdf": "HKDF-SHA256",
-///   "hkdfInfo": "NODO03-ECIES-v1",     // salt vacío, info = este texto en UTF-8, 32 bytes
-///   "ivBase64": "...", "tagBase64": "...",
-///   "recipientThumbprintSha256": "..."
-/// }
+/// 1. Par efímero e, E = e·G (nuevo en cada paquete)
+/// 2. Z = e·Q  (Q = llave pública del keyId; el dueño obtiene lo mismo con d·E)
+/// 3. k = HKDF-SHA256(Z.x, sal vacía, info = "EQ03-ECIES-v1", 32 bytes)
+/// 4. AES-256-GCM(k, nonce) → datos.enc + tag
+/// publicParameters = { keyId, curve=P-256, scheme=ECIES, ephemeralPublicKeyBase64 (SPKI DER),
+///                      kdf=HKDF-SHA256, hkdfInfo, nonceBase64, tagBase64 }
 /// </code>
+/// <para>Los dos primeros nombres y los de la tabla 4.2 son el mínimo; <c>kdf</c> y <c>hkdfInfo</c>
+/// se agregan para que el esquema quede documentado en el propio paquete.</para>
 /// </remarks>
-public sealed class CifradorEcc : ICifradorAsimetrico
+public static class CifradorEcc
 {
-    public const string Esquema = "ECIES-P256-HKDF-SHA256-AES-256-GCM";
-    public const string InfoHkdf = "NODO03-ECIES-v1";
+    public const string Esquema = "ECIES";
+    public const string Curva = "P-256";
+    public const string InfoHkdf = "EQ03-ECIES-v1";
+    public const string Nombre = "ECIES P-256 (ECDH + HKDF-SHA256 + AES-256-GCM)";
 
-    public string Codigo => CodigosAlgoritmo.Ecc;
-
-    public ResultadoCifrado Cifrar(ReadOnlySpan<byte> plano, X509Certificate2 certificadoDestino)
+    public static (byte[] Datos, Dictionary<string, string> Parametros) Cifrar(ReadOnlySpan<byte> plano, ECParameters publica, string keyId)
     {
-        // 1) Llave pública del destinatario (sale de su certificado EC).
-        using var ecdsaDestino = certificadoDestino.GetECDsaPublicKey()
-            ?? throw new CryptographicException("El certificado destino no tiene llave de curva elíptica.");
-        var publicaDestino = ecdsaDestino.ExportParameters(false);
-        using var destino = ECDiffieHellman.Create(publicaDestino);
-
-        // 2) Par efímero, misma curva que el destinatario (P-256).
-        using var efimera = ECDiffieHellman.Create(publicaDestino.Curve);
-
-        // 3) Secreto compartido (coordenada X del punto) -> llave AES con HKDF.
+        using var destino = ECDiffieHellman.Create(publica);
+        using var efimera = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var secreto = efimera.DeriveRawSecretAgreement(destino.PublicKey);
-        var llaveAes = DerivarLlave(secreto);
+        var llave = Derivar(secreto);
         CryptographicOperations.ZeroMemory(secreto);
-
-        // 4) AES-256-GCM.
         var nonce = RandomNumberGenerator.GetBytes(12);
         var tag = new byte[16];
         var cifrado = new byte[plano.Length];
         try
         {
-            using var gcm = new AesGcm(llaveAes, tag.Length);
+            using var gcm = new AesGcm(llave, 16);
             gcm.Encrypt(nonce, plano, cifrado, tag);
         }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(llaveAes);
-        }
+        finally { CryptographicOperations.ZeroMemory(llave); }
 
-        var parametros = new JsonObject
+        return (cifrado, new Dictionary<string, string>(StringComparer.Ordinal)
         {
+            ["keyId"] = keyId,
+            ["curve"] = Curva,
             ["scheme"] = Esquema,
-            ["curve"] = "P-256",
-            // SubjectPublicKeyInfo DER: formato universal (Java X509EncodedKeySpec,
-            // Python load_der_public_key, Node crypto.createPublicKey({format:'der',type:'spki'})).
             ["ephemeralPublicKeyBase64"] = Convert.ToBase64String(efimera.ExportSubjectPublicKeyInfo()),
             ["kdf"] = "HKDF-SHA256",
             ["hkdfInfo"] = InfoHkdf,
-            ["ivBase64"] = Convert.ToBase64String(nonce),
+            ["nonceBase64"] = Convert.ToBase64String(nonce),
             ["tagBase64"] = Convert.ToBase64String(tag),
-            ["recipientThumbprintSha256"] = Huellas.HuellaCertificado(certificadoDestino),
-        };
-        return new ResultadoCifrado(cifrado, parametros, Esquema);
+        });
     }
 
-    public byte[] Descifrar(byte[] cifrado, JsonObject parametrosPublicos, IdentidadNodo identidad)
+    public static byte[] Descifrar(byte[] cifrado, IReadOnlyDictionary<string, string> p, ECDiffieHellman privada)
     {
-        var esquema = parametrosPublicos["scheme"]?.ToString();
-        if (esquema is not null && esquema != Esquema)
-            throw new CryptographicException($"Esquema ECC desconocido: {esquema}");
-
-        // Llave pública efímera del emisor.
+        if (p.GetValueOrDefault("scheme") != Esquema || p.GetValueOrDefault("curve") != Curva)
+            throw new CryptographicException("Se esperaba scheme=ECIES y curve=P-256.");
         using var efimera = ECDiffieHellman.Create();
-        efimera.ImportSubjectPublicKeyInfo(CifradorRsa.Leer64(parametrosPublicos, "ephemeralPublicKeyBase64"), out _);
-
-        // Mi llave privada EC (la misma del certificado) en modo ECDH.
-        using var yo = identidad.CrearEcdhPrivada();
-        var secreto = yo.DeriveRawSecretAgreement(efimera.PublicKey);
-        var llaveAes = DerivarLlave(secreto);
+        efimera.ImportSubjectPublicKeyInfo(CifradorRsa.Leer64(p, "ephemeralPublicKeyBase64"), out _);
+        var secreto = privada.DeriveRawSecretAgreement(efimera.PublicKey);
+        var llave = Derivar(secreto);
         CryptographicOperations.ZeroMemory(secreto);
         try
         {
-            var nonce = CifradorRsa.Leer64(parametrosPublicos, "ivBase64");
-            var tag = CifradorRsa.Leer64(parametrosPublicos, "tagBase64");
             var plano = new byte[cifrado.Length];
-            using var gcm = new AesGcm(llaveAes, tag.Length);
-            gcm.Decrypt(nonce, cifrado, tag, plano);
+            using var gcm = new AesGcm(llave, 16);
+            gcm.Decrypt(CifradorRsa.Leer64(p, "nonceBase64"), cifrado, CifradorRsa.Leer64(p, "tagBase64"), plano);
             return plano;
         }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(llaveAes);
-        }
+        finally { CryptographicOperations.ZeroMemory(llave); }
     }
 
-    /// <summary>HKDF-SHA256(ikm = secreto, salt = vacío, info = "NODO03-ECIES-v1", 32 bytes).</summary>
-    private static byte[] DerivarLlave(byte[] secreto) =>
+    private static byte[] Derivar(byte[] secreto) =>
         HKDF.DeriveKey(HashAlgorithmName.SHA256, secreto, 32, salt: [], info: Encoding.UTF8.GetBytes(InfoHkdf));
 }

@@ -3,7 +3,7 @@
     "Nodo03": {
       "commandName": "Project",
       "launchBrowser": true,
-      "launchUrl": "http://localhost:5000",
+      "launchUrl": "http://localhost:5003",
       "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
     }
   }

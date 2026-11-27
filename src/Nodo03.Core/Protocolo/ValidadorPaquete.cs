@@ -1,119 +1,97 @@
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
 using Nodo03.Core.Cripto;
 
 namespace Nodo03.Core.Protocolo;
 
 /// <summary>
-/// Validación CRIPTOGRÁFICA de un paquete (pasos 3 y 4 de "Validaciones automáticas al recibir").
-/// Funciona con paquetes de CUALQUIER equipo, sin importar con qué algoritmo cifraron datos.enc.
+/// Validaciones 6 a 13 de la sección 13.1 del estándar v2.0, en orden y deteniéndose en la
+/// primera falla. (Las 1–5 las hace <see cref="EmpaquetadorZip.Leer"/> y la 14, duplicados,
+/// la base de datos.) Sirve para paquetes de CUALQUIER equipo y algoritmo.
 /// </summary>
-/// <remarks>
-/// Orden de las revisiones:
-/// <list type="number">
-///   <item><b>Integridad</b>: SHA-256(datos.enc) == manifest.encryptedSha256.</item>
-///   <item><b>Certificado</b>: certificado.pem se puede leer como X.509.</item>
-///   <item><b>Huella</b>: SHA-256(certificado DER) == manifest.certificateThumbprintSha256.
-///   Evita que alguien cambie el certificado por otro.</item>
-///   <item><b>Firma</b>: manifestSignatureBase64 verificada con la llave pública del certificado.</item>
-/// </list>
-/// Además se generan AVISOS (no bloquean): nombre fuera de formato, código de algoritmo
-/// no oficial, certificado vencido, etc. Así se reporta el detalle sin rechazar por
-/// cuestiones de forma a un equipo que, por ejemplo, nombró mal el archivo.
-/// </remarks>
 public static class ValidadorPaquete
 {
-    public static ResultadoValidacion Validar(PaqueteLeido p, string? nombreZip = null)
+    /// <summary>Valida y lanza <see cref="ErrorProtocolo"/> en la primera falla.</summary>
+    public static InfoCertificado Validar(PaqueteLeido p, DateTime ahoraUtc)
     {
-        var r = new ResultadoValidacion();
         var m = p.Manifiesto;
 
-        // 1) Integridad de datos.enc
-        r.Sha256Calculado = Huellas.Sha256Hex(p.DatosEnc);
-        r.IntegridadOk = string.Equals(r.Sha256Calculado, m.EncryptedSha256?.Trim(), StringComparison.OrdinalIgnoreCase);
-        if (!r.IntegridadOk)
-            r.Errores.Add($"SHA-256 de datos.enc no coincide (manifiesto {Corto(m.EncryptedSha256)}…, calculado {Corto(r.Sha256Calculado)}…).");
+        // 6. Versión
+        if (m.Version != Identificadores.VersionProtocolo)
+            throw new ErrorProtocolo("E-VERSION", $"Versión '{m.Version}' no soportada; se espera 2.0.");
 
-        // 2) Certificado legible
-        X509Certificate2? cert = null;
-        try
+        // 7. Algoritmo según la tabla 4.1
+        if (!Diccionario.Coinciden(m.AlgorithmId, m.AlgorithmCode))
+            throw new ErrorProtocolo("E-ALGORITHM", $"algorithmId {m.AlgorithmId} y algorithmCode '{m.AlgorithmCode}' no coinciden con la tabla 4.1.");
+
+        // 8. Integridad del contenido (y de cada parte si es multiparte)
+        if (!Huellas.IgualesConstante(Huellas.Sha256Hex(p.Datos), m.EncryptedSha256))
+            throw new ErrorProtocolo("E-HASH", "El SHA-256 del archivo de datos no coincide con encryptedSha256.");
+        if (m.EncryptedSizeBytes != p.Datos.LongLength)
+            throw new ErrorProtocolo("E-HASH", "encryptedSizeBytes no coincide con el tamaño real.");
+        if (m.PayloadMode == ModosCarga.Multiparte)
         {
-            cert = IdentidadNodo.LeerCertificadoPem(p.CertificadoPem);
-        }
-        catch (CryptographicException)
-        {
-            r.Errores.Add("certificado.pem no es un certificado X.509 PEM válido.");
-        }
-
-        if (cert is not null)
-        {
-            var ahora = DateTime.UtcNow;
-            r.Certificado = new InfoCertificado(
-                cert.Subject, cert.Issuer, cert.NotBefore.ToUniversalTime(), cert.NotAfter.ToUniversalTime(),
-                IdentidadNodo.TipoDeLlave(cert) ?? "?", Huellas.HuellaCertificado(cert),
-                cert.SubjectName.RawData.AsSpan().SequenceEqual(cert.IssuerName.RawData),
-                ahora >= cert.NotBefore.ToUniversalTime() && ahora <= cert.NotAfter.ToUniversalTime());
-
-            if (!r.Certificado.Vigente)
-                r.Avisos.Add($"El certificado no está vigente ({r.Certificado.NoAntes:yyyy-MM-dd} a {r.Certificado.NoDespues:yyyy-MM-dd}).");
-
-            // 3) Huella del certificado
-            r.HuellaOk = Huellas.HuellasIguales(r.Certificado.Huella, m.CertificateThumbprintSha256);
-            if (!r.HuellaOk)
-                r.Errores.Add("certificateThumbprintSha256 no corresponde al certificado incluido.");
-
-            // 4) Firma
-            var firma = FirmaManifiesto.Verificar(m, cert, p.ManifiestoJson);
-            r.FirmaOk = firma.Valida;
-            r.DetalleFirma = firma.Detalle;
-            if (!firma.Valida) r.Errores.Add(firma.Detalle);
-            cert.Dispose();
-        }
-
-        // Avisos de forma (no invalidan el paquete)
-        if (!CodigosAlgoritmo.EsOficial(m.AlgorithmCode))
-            r.Avisos.Add($"algorithmCode '{m.AlgorithmCode}' no está en la tabla 1.1.");
-        if (nombreZip is not null)
-        {
-            if (!NombrePaquete.TryParse(nombreZip, out var partes))
-                r.Avisos.Add($"El nombre '{nombreZip}' no sigue NODO_ALGORITMO_YYYYMMDD_HHMMSS_SHA8.zip.");
-            else
+            var partes = EmpaquetadorZip.LeerPartes(p.Datos);
+            foreach (var esperada in m.Parts!)
             {
-                if (!r.Sha256Calculado.StartsWith(partes.Sha8, StringComparison.OrdinalIgnoreCase))
-                    r.Avisos.Add("El SHA8 del nombre no coincide con el SHA-256 real de datos.enc.");
-                if (!string.IsNullOrEmpty(m.AlgorithmCode) && partes.Algoritmo != m.AlgorithmCode)
-                    r.Avisos.Add("El algoritmo del nombre no coincide con algorithmCode del manifiesto.");
+                var real = partes.FirstOrDefault(x => x.Nombre == esperada.Name);
+                if (real.Bytes is null || real.Bytes.LongLength != esperada.SizeBytes || !Huellas.IgualesConstante(Huellas.Sha256Hex(real.Bytes), esperada.Sha256))
+                    throw new ErrorProtocolo("E-HASH", $"La parte {esperada.Name} no coincide con su SHA-256 o tamaño.");
             }
         }
-        if (!DateTime.TryParse(m.TimestampUtc, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out _))
-            r.Avisos.Add("timestampUtc no es una fecha ISO-8601 válida.");
 
-        return r;
+        // 9. Hash canónico de publicParameters (8.5)
+        if (!Huellas.IgualesConstante(ParametrosCanonicos.Hash(m.PublicParameters), m.PublicParametersSha256))
+            throw new ErrorProtocolo("E-PARAMS-HASH", "publicParametersSha256 no corresponde al texto canónico de publicParameters.");
+
+        // 10. Certificado: X.509 RSA-2048, CN = sourceNode, vigente
+        System.Security.Cryptography.X509Certificates.X509Certificate2 cert;
+        try { cert = IdentidadNodo.LeerPem(p.CertificadoPem); }
+        catch (CryptographicException) { throw new ErrorProtocolo("E-CERT", "certificado.pem no es un X.509 PEM válido."); }
+        using (cert)
+        {
+            if (IdentidadNodo.ProblemaCertificado(cert, m.SourceNode, ahoraUtc) is { } problema)
+                throw new ErrorProtocolo("E-CERT", problema);
+
+            // 11. Huella
+            var huella = Huellas.HuellaCertificado(cert);
+            if (!Huellas.IgualesConstante(huella, m.CertificateThumbprintSha256))
+                throw new ErrorProtocolo("E-CERT-THUMBPRINT", "certificateThumbprintSha256 no corresponde a certificado.pem.");
+
+            // 12. Firma sobre la cadena 8.4
+            if (!FirmaManifiesto.Verificar(m, cert))
+                throw new ErrorProtocolo("E-SIGNATURE", "La firma RSA-PSS-SHA256 no corresponde a la cadena de firma 8.4.");
+
+            // 13. Ventana de ±10 minutos
+            if (!Identificadores.DentroDeVentana(m.TimestampUtc, ahoraUtc))
+                throw new ErrorProtocolo("E-TIMESTAMP", $"timestampUtc {m.TimestampUtc} está fuera de ±10 min del reloj del receptor.");
+
+            return new InfoCertificado(cert.Subject, huella, cert.NotBefore.ToUniversalTime(), cert.NotAfter.ToUniversalTime());
+        }
     }
 
-    private static string Corto(string? s) => string.IsNullOrEmpty(s) ? "(vacío)" : s[..Math.Min(8, s.Length)];
-}
-
-/// <summary>Resultado completo de la validación (se guarda y se muestra en la interfaz).</summary>
-public sealed class ResultadoValidacion
-{
-    public bool IntegridadOk { get; set; }
-    public string Sha256Calculado { get; set; } = "";
-    public bool HuellaOk { get; set; }
-    public bool FirmaOk { get; set; }
-    public string DetalleFirma { get; set; } = "";
-    public InfoCertificado? Certificado { get; set; }
-    public List<string> Errores { get; } = [];
-    public List<string> Avisos { get; } = [];
-
-    /// <summary>Paquete íntegro y auténtico: los tres chequeos criptográficos pasaron.</summary>
-    public bool Valido => IntegridadOk && HuellaOk && FirmaOk;
-
-    /// <summary>Texto corto que pide la propuesta para la bandeja: "X.509 OK" / "Inválida".</summary>
-    public string Etiqueta => Valido ? "X.509 OK" : "Inválida";
+    /// <summary>
+    /// Igual que <see cref="Validar"/> pero devuelve el resultado en vez de lanzar (para el
+    /// Verificador de la interfaz, que muestra la lista completa).
+    /// </summary>
+    public static ResultadoValidacion Revisar(byte[] zip, DateTime ahoraUtc)
+    {
+        try
+        {
+            var p = EmpaquetadorZip.Leer(zip);
+            var info = Validar(p, ahoraUtc);
+            return new ResultadoValidacion(true, null, null, "Paquete íntegro y firmado correctamente.", p.Manifiesto, info);
+        }
+        catch (ErrorProtocolo e)
+        {
+            Manifiesto? m = null;
+            try { m = EmpaquetadorZip.Leer(zip).Manifiesto; } catch (ErrorProtocolo) { }
+            return new ResultadoValidacion(false, e.Codigo, e.Status, e.Message, m, null);
+        }
+    }
 }
 
 /// <summary>Datos legibles del certificado del emisor.</summary>
-public sealed record InfoCertificado(
-    string Sujeto, string Emisor, DateTime NoAntes, DateTime NoDespues,
-    string TipoLlave, string Huella, bool Autofirmado, bool Vigente);
+public sealed record InfoCertificado(string Sujeto, string Huella, DateTime NoAntes, DateTime NoDespues);
+
+/// <summary>Resultado completo para mostrar.</summary>
+public sealed record ResultadoValidacion(bool Valido, string? Codigo, int? Status, string Detalle, Manifiesto? Manifiesto, InfoCertificado? Certificado);

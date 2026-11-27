@@ -1,13 +1,13 @@
 /* =====================================================================
-   Nodo 03 · Oficialía de Partes Cifrada — lógica de la interfaz
+   Nodo EQ03 · Oficialía de Partes Cifrada — lógica de la interfaz (v2.0)
    ---------------------------------------------------------------------
    JavaScript sin frameworks, organizado así:
-     1. Utilidades (escapar HTML, fechas, tamaños, hashes)
+     1. Utilidades (escapar HTML, fechas, tamaños, hashes, sellos)
      2. Cliente de la API local (/api/local/...)
      3. Alertamiento en tiempo real (Server-Sent Events + sonido + notificación)
-     4. Enrutador por hash (#/panel, #/enviar, ...)
+     4. Enrutador por hash (#/panel, #/operar, ...)
      5. Una función por pantalla
-     6. Cajón lateral (detalle de Consultas)
+     6. Cajón lateral (detalle de Solicitudes y Consultas)
    Regla de seguridad: TODO texto que viene del servidor (y que pudo escribir
    otro equipo, como nombres de archivo) pasa por esc() antes de ir al HTML,
    para evitar inyección de HTML/JS (XSS).
@@ -47,11 +47,14 @@ function hashHtml(h) {
   return `<span class="hash"><mark>${esc(h.slice(0, 8))}</mark>${esc(h.slice(8))}</span>`;
 }
 
-/** Sello de verificación X.509. */
+/** Huella en grupos de 4 para leerla en voz alta al confirmar (TOFU). */
+const huellaLegible = h => h ? esc(h.match(/.{1,4}/g).join(' ')) : '—';
+
+/** Sello de validación de la sección 15: Firma OK / Inválida / Remitente no confirmado. */
 function selloVerif(v) {
-  return v === 'X.509 OK'
-    ? '<span class="sello sello--ok">X.509 OK</span>'
-    : `<span class="sello sello--mal">${esc(v || 'Inválida')}</span>`;
+  if (v === 'Firma OK') return '<span class="sello sello--ok">Firma OK</span>';
+  if (v === 'Remitente no confirmado') return '<span class="sello sello--pend">Remitente no confirmado</span>';
+  return `<span class="sello sello--mal">${esc(v || 'Inválida')}</span>`;
 }
 
 /** Sello de estado de una solicitud. */
@@ -66,13 +69,25 @@ function chipAlg(codigo) {
   return `<span class="chip ${clase}">${esc(c || '¿?')}</span>`;
 }
 
-const nombreModo = m => ({ text: 'Texto', image: 'Imagen', file: 'Archivo' }[m] || m);
+const nombreModo = m => ({ text: 'Texto', image: 'Imagen', file: 'Archivo', multipart: 'Multiparte' }[m] || m);
 
 /** Almacenamiento del navegador con try/catch (puede estar bloqueado). */
 const preferencia = {
   leer(k, def) { try { const v = localStorage.getItem('nodo03.' + k); return v === null ? def : JSON.parse(v); } catch { return def; } },
   guardar(k, v) { try { localStorage.setItem('nodo03.' + k, JSON.stringify(v)); } catch { /* sin almacenamiento */ } },
 };
+
+/** Muestra el contenido en claro que devuelve un inverse (texto, imagen o archivo). */
+function htmlClaro(d) {
+  let cuerpo;
+  if (d.texto != null && d.modo === 'text') cuerpo = `<blockquote>${esc(d.texto)}</blockquote>`;
+  else if (String(d.mime).startsWith('image/') && d.base64) cuerpo = `<img alt="Imagen recuperada" src="data:${esc(d.mime)};base64,${d.base64}">`;
+  else cuerpo = `<p>${esc(d.nombre)} · ${tamano(d.tamano)}</p>`;
+  const veredicto = d.verificacion ? `<p class="${d.verificacion.valid ? '' : 'mal'}"><strong>Verificación:</strong> ${d.verificacion.valid ? 'válida' : 'NO válida'} · ${esc(d.verificacion.detail)}</p>` : '';
+  const enlace = d.base64 ? `<a class="btn btn--sec btn--chico" style="margin-top:8px" href="data:${esc(d.mime)};base64,${d.base64}" download="${esc(d.nombre)}">Guardar ${esc(d.nombre)}</a>` : '';
+  return `<div class="cajon__seccion"><span class="etiqueta">Resultado · ejecutó ${esc(d.ejecutor)}${d.delegado ? ' (delegado)' : ' (local)'}</span>
+    <div class="claro">${veredicto}${cuerpo}</div>${enlace}</div>`;
+}
 
 /* ------------------------------------------------------------------ 2. API */
 
@@ -83,7 +98,7 @@ async function pedir(metodo, url, cuerpo) {
   const r = await fetch(url, opciones);
   const tipo = r.headers.get('content-type') || '';
   const datos = tipo.includes('json') ? await r.json() : await r.text();
-  if (!r.ok) throw new Error((datos && datos.error) || (datos && datos.message) || `Error ${r.status}`);
+  if (!r.ok) throw new Error((datos && (datos.error || datos.detail || datos.message)) || `Error ${r.status}`);
   return datos;
 }
 const api = {
@@ -133,18 +148,16 @@ function notificarSistema(titulo, texto) {
   try { new Notification(titulo, { body: texto, tag: 'nodo03' }); } catch { /* algunos navegadores lo bloquean */ }
 }
 
+let nodoActual = 'EQ03';
 /** Contador de pendientes en la pestaña "Solicitudes" y en el título de la ventana. */
 function actualizarContador(n) {
   const b = $('#contador-pendientes');
   b.textContent = n;
   b.hidden = !n;
-  document.title = (n ? `(${n}) ` : '') + 'Nodo 03 · Oficialía de Partes Cifrada';
+  document.title = (n ? `(${n}) ` : '') + `${nodoActual} · Oficialía de Partes Cifrada`;
 }
 
-/**
- * Conexión SSE con el servidor. El navegador reconecta solo si se cae;
- * solo actualizamos el indicador de estado del membrete.
- */
+/** Conexión SSE con el servidor. El navegador reconecta solo si se cae. */
 function conectarEventos() {
   const estado = $('#estado-conexion');
   const poner = (e, t) => { estado.dataset.estado = e; estado.querySelector('span').textContent = t; };
@@ -155,10 +168,10 @@ function conectarEventos() {
   fuente.addEventListener('solicitud', ev => {
     const d = JSON.parse(ev.data);
     actualizarContador(d.pendientes);
-    const valida = d.verificacion === 'X.509 OK';
+    const valida = d.verificacion !== 'Inválida';
     const titulo = valida ? `Llegó un paquete de ${d.nodo}` : `Paquete INVÁLIDO de ${d.nodo}`;
-    const texto = `${d.zip} · ${d.algoritmo}${d.salto ? ' · rebote #' + d.salto : ''}`;
-    telegrama(titulo, texto, valida ? 'ok' : 'mal', '#/solicitudes');
+    const texto = `${d.zip} · ${d.algoritmo} ${d.operacion || ''} · ${d.verificacion}${d.salto ? ' · rebote #' + d.salto : ''}`;
+    telegrama(titulo, texto, valida ? (d.verificacion === 'Firma OK' ? 'ok' : 'alerta') : 'mal', '#/solicitudes');
     sonar(valida ? 'ok' : 'mal');
     notificarSistema(titulo, texto);
     refrescarSi(['solicitudes', 'panel']);
@@ -177,6 +190,23 @@ function conectarEventos() {
   };
   fuente.addEventListener('envio', alEnviar);
   fuente.addEventListener('rebote', alEnviar);
+  fuente.addEventListener('consulta', () => refrescarSi(['consultas', 'panel']));
+  fuente.addEventListener('nodo', ev => {
+    const d = JSON.parse(ev.data);
+    if (d.nuevo) telegrama(`Nodo nuevo: ${d.nodeId}`, `${d.direccion} · confirma su huella en Nodos`, 'alerta', '#/nodos');
+    refrescarSi(['nodos', 'panel']);
+  });
+  fuente.addEventListener('alerta', ev => {
+    const d = JSON.parse(ev.data);
+    telegrama('¡Cambio de certificado!', d.mensaje + ' — no se usará hasta que lo confirmes.', 'mal', '#/nodos');
+    sonar('mal');
+    notificarSistema('Cambio de certificado', d.mensaje);
+    refrescarSi(['nodos']);
+  });
+  fuente.addEventListener('trabajo', ev => {
+    const d = JSON.parse(ev.data);
+    telegrama(`${d.nodo} está procesando`, d.mensaje, 'alerta');
+  });
   fuente.addEventListener('error', ev => {
     if (!ev.data) return; // errores de conexión de EventSource también llegan como 'error'
     const d = JSON.parse(ev.data);
@@ -191,7 +221,7 @@ const pantallas = {};
 let rutaActual = '';
 
 function refrescarSi(rutas) {
-  // No redibujamos el formulario de Enviar ni el Verificador para no borrar lo que el usuario escribió.
+  // No redibujamos Operar ni el Verificador para no borrar lo que el usuario escribió.
   if (rutas.includes(rutaActual)) pantallas[rutaActual]?.(true);
 }
 
@@ -217,57 +247,65 @@ function pintar(html) { $('#vista').innerHTML = html; }
 
 /* ===== Panel ===== */
 pantallas.panel = async () => {
-  const [id, bitacora] = await Promise.all([api.get('/api/local/identidad'), api.get('/api/local/bitacora?limite=150')]);
+  const [id, bitacora, llaves] = await Promise.all([
+    api.get('/api/local/identidad'), api.get('/api/local/bitacora?limite=150'), api.get('/api/local/llaves')]);
   actualizarContador(id.pendientes);
+  const c = id.certificado;
 
   // Agrupa la bitácora por rally (cada pelota de ping-pong tiene su rallyId).
   const rallies = new Map();
+  const golpes = ['recepcion', 'envio', 'rebote', 'rechazo-automatico'];
   [...bitacora].reverse().forEach(e => {
-    if (!e.rallyId || e.salto == null) return;
+    if (!e.rallyId || e.salto == null || !golpes.includes(e.tipo)) return;
     if (!rallies.has(e.rallyId)) rallies.set(e.rallyId, []);
     rallies.get(e.rallyId).push(e);
   });
   const ultimos = [...rallies.entries()].slice(-5).reverse();
-
   const golpe = e => {
-    const tipo = e.tipo === 'recepcion' ? 'entra' : e.tipo === 'rechazo-automatico' || e.tipo === 'error' ? 'mal' : 'sale';
-    if (!['recepcion', 'envio', 'rebote', 'rechazo-automatico', 'generado'].includes(e.tipo)) return '';
+    const tipo = e.tipo === 'recepcion' ? 'entra' : e.tipo === 'rechazo-automatico' ? 'mal' : 'sale';
     return `<span class="golpe golpe--${tipo}" title="${esc(e.mensaje)}"><span class="golpe__bola">${e.salto}</span><span class="golpe__red"></span></span>`;
   };
 
   pintar(`
     <div class="encabezado">
       <div>
-        <span class="etiqueta">Mesa de control</span>
+        <span class="etiqueta">Mesa de control · protocolo v${esc(id.protocolo)}</span>
         <h1>Panel del ${esc(id.nodoId)}</h1>
-        <p>Cada paquete es un oficio sellado con certificado X.509. Aquí se ve quién envió qué y cómo va el ping-pong entre células.</p>
+        <p>Proveedor de ${id.provee.length ? id.provee.map(chipAlg).join(' ') : 'ningún algoritmo (solo solicitante)'} para el Centro de Ciberseguridad. Los demás algoritmos se delegan a su dueño.</p>
       </div>
-      <a class="btn btn--grande" href="#/enviar">✉ Nuevo envío</a>
+      <a class="btn btn--grande" href="#/operar">✉ Cifrar / operar</a>
     </div>
 
-    <div class="rejilla rejilla--3" style="margin-bottom:18px">
+    <div class="rejilla rejilla--4" style="margin-bottom:18px">
       <a class="hoja cifra cifra--sello" href="#/solicitudes" style="text-decoration:none;color:inherit">
         <span class="etiqueta">Solicitudes pendientes</span><b>${id.pendientes}</b></a>
       <a class="hoja cifra cifra--verde" href="#/consultas" style="text-decoration:none;color:inherit">
         <span class="etiqueta">Registros en Consultas</span><b>${id.consultas}</b></a>
+      <a class="hoja cifra" href="#/nodos" style="text-decoration:none;color:inherit">
+        <span class="etiqueta">Nodos en línea</span><b>${id.nodos}</b></a>
       <div class="hoja cifra"><span class="etiqueta">Dirección en la LAN</span>
-        <b style="font:600 20px var(--f-mono);margin-top:12px">${esc(id.direccion)}</b></div>
+        <b style="font:600 19px var(--f-mono);margin-top:12px">${esc(id.direccion)}</b>
+        <span class="ayuda">UDP ${id.udp.puerto}: ${id.udp.activo ? `anunciando cada ${id.udp.intervalo} s · ${id.udp.recibidos} anuncios oídos` : 'apagado o bloqueado'}</span></div>
     </div>
 
     <div class="rejilla rejilla--panel">
       <section class="hoja credencial" aria-labelledby="t-cred">
-        <div class="hoja__titulo"><h2 id="t-cred">Credencial del nodo</h2><span class="etiqueta">Certificados públicos</span></div>
-        ${id.certificados.map(c => `
-          <div class="cert">
-            <span class="cert__tipo cert__tipo--${c.codigo.toLowerCase()}">${c.codigo}</span>
-            <div>
-              <strong>${esc(c.llave)}</strong>
-              <small>Firma: ${esc(c.firma)} · vigente hasta ${new Date(c.hasta).toLocaleDateString('es-MX')}</small>
-              <div class="hash" title="Huella SHA-256 del certificado">${esc(c.huella.match(/.{1,4}/g).join(' '))}</div>
-            </div>
-            <a class="btn btn--sec btn--chico" href="/api/local/certificado/${c.codigo}" download>.pem</a>
-          </div>`).join('')}
-        <p class="ayuda" style="margin-top:10px">Comparte estas huellas con los demás equipos: si coinciden con las del paquete que reciben, el paquete es del Nodo 03.</p>
+        <div class="hoja__titulo"><h2 id="t-cred">Credencial del nodo</h2><span class="etiqueta">Identidad X.509 (sección 7)</span></div>
+        <div class="cert">
+          <span class="cert__tipo cert__tipo--rsa">ID</span>
+          <div>
+            <strong>${esc(c.sujeto)}</strong>
+            <small>${esc(c.llave)} · ${esc(c.firmaCertificado)} · manifiestos ${esc(c.firmaManifiestos)} · vigente hasta ${new Date(c.hasta).toLocaleDateString('es-MX')}</small>
+            <div class="hash" title="Huella SHA-256 del certificado (DER)">${huellaLegible(c.huella)}</div>
+          </div>
+          <a class="btn btn--sec btn--chico" href="/api/local/certificado" download>.pem</a>
+        </div>
+        <p class="ayuda" style="margin-top:10px">Esta huella es la que los demás equipos deben confirmar (TOFU). Si la regeneras, verán una alerta.</p>
+        <div class="cajon__seccion"><span class="etiqueta">Llaves de algoritmo (keyId) · ${id.llaves}</span>
+          ${llaves.length ? `<ul class="bitacora" style="max-height:180px">${llaves.slice(0, 12).map(k => `
+            <li><time>${esc(k.algoritmo)}</time><span class="mono" title="${k.restringida ? 'Solo: ' + esc(k.permitidos) : 'Cualquier nodo'}">${esc(k.keyId)}${k.restringida ? ' 🔒' : ''}</span></li>`).join('')}</ul>`
+            : '<p class="ayuda">Aún no hay llaves: se crea una por cada forward RSA/ECC sin keyId.</p>'}
+        </div>
       </section>
 
       <section class="hoja" aria-labelledby="t-rally">
@@ -276,37 +314,75 @@ pantallas.panel = async () => {
           <div class="rally">
             <div class="rally__cab"><span>Rally <code>${esc(rid.slice(0, 8))}</code></span><span>${eventos.length} ${eventos.length === 1 ? 'golpe' : 'golpes'} · ${fecha(eventos.at(-1).fechaUtc, false)}</span></div>
             <div class="mesa">${eventos.map(golpe).join('')}</div>
-          </div>`).join('') : `<div class="vacio"><strong>Aún no hay pelotas en juego</strong>Envía un paquete RSA o ECC a otro nodo para empezar.</div>`}
+          </div>`).join('') : `<div class="vacio"><strong>Aún no hay pelotas en juego</strong>Cifra con RSA o ECC y mándalo a la bandeja de otro nodo.</div>`}
         <div class="leyenda"><span><i class="l-sale"></i>sale de este nodo</span><span><i class="l-entra"></i>llega a este nodo</span><span>el número es el rebote</span></div>
       </section>
     </div>
 
     <section class="hoja" style="margin-top:18px" aria-labelledby="t-bit">
-      <div class="hoja__titulo"><h2 id="t-bit">Bitácora</h2><span class="etiqueta">En tiempo real</span></div>
+      <div class="hoja__titulo"><h2 id="t-bit">Bitácora</h2><span class="etiqueta">En tiempo real · sin secretos</span></div>
       <ul class="bitacora">
-        ${bitacora.slice(0, 40).map(e => `<li><time>${fecha(e.fechaUtc, false)}</time><span class="t-${esc(e.tipo)}">${esc(e.mensaje)}</span></li>`).join('')}
+        ${bitacora.slice(0, 50).map(e => `<li><time>${fecha(e.fechaUtc, false)}</time><span class="t-${esc(e.tipo)}">${esc(e.mensaje)}</span></li>`).join('')}
       </ul>
     </section>`);
 };
 
-/* ===== Enviar (Modo Emisor) ===== */
-pantallas.enviar = async (refresco, extra = []) => {
+/* ===== Operar (forward con cualquiera de los 21 algoritmos) ===== */
+
+/**
+ * Campos de parámetros para un algoritmo. Si el dueño publica su perfil
+ * (GET /api/algorithms, sección 10.4) se usa; si no, el mínimo de la tabla 4.2.
+ */
+function camposParametros(alg, perfil) {
+  const secretos = perfil?.secretParameters?.length ? perfil.secretParameters
+    : (alg.secretos || []).map(n => ({ name: n, type: 'texto' }));
+  const opciones = (perfil?.options || []).filter(o => !['hop', 'rallyId'].includes(o.name));
+  const campoSecreto = s => `
+    <label class="campo"><span class="etiqueta">${esc(s.name)} · secreto${alg.llave === 'SecretaOpcional' ? ' (opcional)' : ''}</span>
+      <input type="password" data-secreto="${esc(s.name)}" autocomplete="off" placeholder="${esc(s.type || '')}${s.minBytes ? ' · mín. ' + s.minBytes + ' bytes' : ''}">
+    </label>`;
+  const campoOpcion = o => Array.isArray(o.values) && o.values.length
+    ? `<label class="campo"><span class="etiqueta">${esc(o.name)}</span><select data-opcion="${esc(o.name)}">
+        ${o.values.map(v => `<option ${v === o.default ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>`
+    : `<label class="campo"><span class="etiqueta">${esc(o.name)}${o.required ? '' : ' (opcional)'}</span>
+        <input type="text" data-opcion="${esc(o.name)}" value="${esc(o.default || '')}" placeholder="${esc(o.description || '')}"></label>`;
+  return `
+    ${alg.llave === 'KeyId' ? `
+      <label class="campo"><span class="etiqueta">keyId (opcional)</span>
+        <input type="text" data-keyid style="font-family:var(--f-mono)" placeholder="vacío = ${esc(alg.dueno)} genera una llave nueva">
+        <span class="ayuda">La llave la guarda el dueño del algoritmo. Para reutilizar una, pega su keyId (EQ03-KEY-…).</span></label>` : ''}
+    ${secretos.map(campoSecreto).join('')}
+    ${opciones.map(campoOpcion).join('')}
+    ${alg.codigo === 'LSBSTEGO' ? `<label class="campo"><span class="etiqueta">Imagen portadora (cover) PNG/BMP</span><input type="file" data-cover accept=".png,.bmp,image/png,image/bmp"></label>` : ''}
+    ${secretos.length ? '<p class="ayuda">Los secretos viajan cifrados en un sobre CC-ENV-1 solo para el dueño; este nodo no los guarda.</p>' : ''}
+    ${!secretos.length && !opciones.length && alg.llave !== 'KeyId' ? '<p class="ayuda">Este algoritmo no necesita parámetros.</p>' : ''}`;
+}
+
+/** Lee los campos de parámetros del formulario. */
+function leerParametros(raiz) {
+  const secretos = {}, opciones = {};
+  $$('[data-secreto]', raiz).forEach(i => { if (i.value) secretos[i.dataset.secreto] = i.value; });
+  $$('[data-opcion]', raiz).forEach(i => { if (i.value) opciones[i.dataset.opcion] = i.value; });
+  return { secretos, opciones, keyId: $('[data-keyid]', raiz)?.value.trim() || '', cover: $('[data-cover]', raiz)?.files[0] };
+}
+
+pantallas.operar = async (refresco) => {
   if (refresco) return;
-  const nodos = await api.get('/api/local/nodos').catch(() => []);
-  const ipInicial = extra[0] ? decodeURIComponent(extra[0]) : '';
+  const [algoritmos, nodos] = await Promise.all([api.get('/api/local/algoritmos'), api.get('/api/local/nodos').catch(() => [])]);
+  const inicial = algoritmos.find(a => a.propio && a.disponible) || algoritmos.find(a => a.disponible) || algoritmos[0];
 
   pintar(`
     <div class="encabezado"><div>
-      <span class="etiqueta">Modo emisor</span>
-      <h1>Nuevo envío</h1>
-      <p>Carga una frase, una imagen o un archivo. Se cifra con RSA o ECC, se firma con el certificado del nodo y se manda como <code>.zip</code> estándar.</p>
+      <span class="etiqueta">Roles emisor y solicitante · forward</span>
+      <h1>Cifrar / operar</h1>
+      <p>Elige cualquiera de los 21 algoritmos. RSA y ECC se ejecutan aquí; los demás se le piden a su dueño con <code>/api/crypto/forward</code>. El resultado es un <code>.zip</code> v2.0 que puedes mandar a la bandeja de otro nodo.</p>
     </div></div>
 
-    <form class="hoja" id="form-envio" novalidate>
+    <form class="hoja" id="form-op" novalidate>
       <div class="paso">
         <span class="paso__num">1</span>
         <div>
-          <h2>¿Qué vas a cifrar?</h2>
+          <h2>¿Qué vas a procesar?</h2>
           <div class="segmentos" role="radiogroup" aria-label="Tipo de contenido">
             <label><input type="radio" name="modo" value="text" checked><span>Frase</span></label>
             <label><input type="radio" name="modo" value="image"><span>Imagen</span></label>
@@ -314,8 +390,8 @@ pantallas.enviar = async (refresco, extra = []) => {
           </div>
           <div id="caja-texto">
             <label class="campo"><span class="etiqueta">Mensaje</span>
-              <textarea name="texto" placeholder="Ej. CURP: VERA040101HDFLMR09 — información de prueba para la célula 5"></textarea></label>
-            <p class="ayuda" id="cuenta-texto">0 bytes. Hasta 190 bytes RSA cifra directo; más largo usa RSA + AES-GCM.</p>
+              <textarea name="texto" placeholder="Ej. CURP: VERA040101HDFLMR09 — información de prueba"></textarea></label>
+            <p class="ayuda" id="cuenta-texto">0 bytes</p>
           </div>
           <div id="caja-archivo" hidden>
             <label class="soltar" id="soltar">
@@ -332,75 +408,61 @@ pantallas.enviar = async (refresco, extra = []) => {
         <span class="paso__num">2</span>
         <div>
           <h2>Algoritmo</h2>
-          <div class="algoritmos">
-            <label class="algoritmo"><input type="radio" name="algoritmo" value="RSA" checked>
-              <div><span class="etiqueta">#5 · Asimétrico</span><b>RSA</b>
-                <small>RSA-2048 con OAEP-SHA256 para cifrar y PSS-SHA256 para firmar. Contenidos grandes: híbrido RSA + AES-256-GCM.</small></div></label>
-            <label class="algoritmo"><input type="radio" name="algoritmo" value="ECC">
-              <div><span class="etiqueta">#6 · Curva elíptica</span><b>ECC</b>
-                <small>ECIES sobre P-256: ECDH efímero + HKDF-SHA256 + AES-256-GCM. Firma ECDSA-P256-SHA256.</small></div></label>
+          <div class="algoritmos algoritmos--21">
+            ${algoritmos.map(a => `
+              <label class="algoritmo ${a.disponible ? '' : 'algoritmo--no'}" title="${esc(a.motivo)}">
+                <input type="radio" name="algoritmo" value="${esc(a.codigo)}" ${a.codigo === inicial.codigo ? 'checked' : ''}>
+                <div><span class="etiqueta">#${a.id} · ${esc(a.dueno)}</span><b>${esc(a.codigo)}</b>
+                  <small>${esc(a.nombre)}</small>
+                  <small class="algoritmo__estado">${a.propio ? '● local' : a.disponible ? '● ' + esc(a.ejecutor) : '○ no disponible'}</small></div></label>`).join('')}
           </div>
+          <p class="ayuda" id="motivo-alg" style="margin-top:10px"></p>
         </div>
       </div>
 
       <div class="paso">
         <span class="paso__num">3</span>
         <div>
-          <h2>Destino</h2>
-          <label class="campo"><span class="etiqueta">Dirección del nodo (IP:Puerto)</span>
-            <div class="acciones">
-              <input type="text" name="direccion" list="nodos-conocidos" placeholder="192.168.1.14:5000" value="${esc(ipInicial)}" style="flex:1 1 220px;font-family:var(--f-mono)" autocomplete="off">
-              <button type="button" class="btn btn--sec" id="probar">Probar conexión</button>
-            </div>
-            <datalist id="nodos-conocidos">${nodos.map(n => `<option value="${esc(n.direccion)}">${esc(n.nodoId)}</option>`).join('')}</datalist>
-          </label>
-          <p class="ayuda" id="resultado-prueba"></p>
-
-          <span class="etiqueta" style="display:block;margin:12px 0 8px">¿Para quién se cifra? (dueño de la llave pública)</span>
-          <div class="destinos">
-            <label class="destino"><input type="radio" name="destinatario" value="remoto" checked>
-              <div><strong>Para el nodo destino</strong><div class="ayuda">Se pide su certificado a <code>/api/certificate</code>. Solo él podrá descifrar. Es el modo del ping-pong.</div></div></label>
-            <label class="destino"><input type="radio" name="destinatario" value="pem">
-              <div><strong>Para un certificado que subo</strong><div class="ayuda">Útil si el otro equipo te pasó su <code>.pem</code> pero su nodo no lo publica.</div>
-                <div class="sub"><input type="file" name="certificado" accept=".pem,.crt,.cer"></div></div></label>
-            <label class="destino"><input type="radio" name="destinatario" value="propio">
-              <div><strong>Para mí (Nodo 03)</strong><div class="ayuda">Para equipos que solo validan la firma, o para generar un archivo de prueba.</div></div></label>
-          </div>
-
-          <label class="interruptor" style="margin-top:14px"><input type="checkbox" name="soloGenerar"> Solo generar el <code>.zip</code> (no enviar por la red)</label>
+          <h2>Parámetros</h2>
+          <div id="parametros"></div>
         </div>
       </div>
 
       <div class="acciones" style="margin-top:26px;justify-content:flex-end">
-        <button class="btn btn--grande" type="submit" id="btn-enviar">Sellar y enviar</button>
+        <button class="btn btn--grande" type="submit" id="btn-op">Ejecutar forward</button>
       </div>
     </form>
     <div id="acuse"></div>`);
 
-  const form = $('#form-envio');
+  const form = $('#form-op');
   const modoActual = () => form.modo.value;
+  const algActual = () => algoritmos.find(a => a.codigo === form.algoritmo.value);
 
-  // Cambiar entre frase / imagen / archivo
+  async function alCambiarAlgoritmo() {
+    const a = algActual();
+    $('#motivo-alg').innerHTML = `<strong>${esc(a.codigo)}</strong> (${esc(a.forward)} / ${esc(a.inverse)}) · ${esc(a.motivo)}`;
+    $('#btn-op').textContent = `${a.forward[0].toUpperCase() + a.forward.slice(1)} con ${a.codigo}`;
+    $('#btn-op').disabled = !a.disponible;
+    $('#parametros').innerHTML = camposParametros(a, null);
+    if (!a.disponible) return;
+    try {
+      const p = await api.get(`/api/local/perfil/${a.codigo}`);
+      if (form.algoritmo.value === a.codigo && p.perfil) $('#parametros').innerHTML = camposParametros(a, p.perfil);
+    } catch { /* sin perfil: se queda el mínimo de la tabla 4.2 */ }
+  }
+
   form.addEventListener('change', e => {
     if (e.target.name === 'modo') {
       $('#caja-texto').hidden = modoActual() !== 'text';
       $('#caja-archivo').hidden = modoActual() === 'text';
       $('#archivo').accept = modoActual() === 'image' ? 'image/*' : '';
     }
-    if (e.target.name === 'soloGenerar' || e.target.name === 'destinatario') {
-      $('#btn-enviar').textContent = form.soloGenerar.checked ? 'Sellar y generar .zip' : 'Sellar y enviar';
-    }
+    if (e.target.name === 'algoritmo') alCambiarAlgoritmo();
   });
-
-  // Contador de bytes (UTF-8) para explicar RSA directo vs híbrido
   form.texto.addEventListener('input', () => {
-    const n = new TextEncoder().encode(form.texto.value).length;
-    $('#cuenta-texto').textContent = `${n} bytes · ` + (n <= 190
-      ? 'con RSA se cifra DIRECTO con la llave pública (RSA-OAEP).'
-      : 'con RSA se usa el esquema HÍBRIDO (RSA-OAEP protege una llave AES-256-GCM).');
+    $('#cuenta-texto').textContent = `${new TextEncoder().encode(form.texto.value).length} bytes (UTF-8)`;
   });
 
-  // Arrastrar y soltar + vista previa
   const zona = $('#soltar'), entrada = $('#archivo');
   ['dragenter', 'dragover'].forEach(t => zona.addEventListener(t, e => { e.preventDefault(); zona.classList.add('encima'); }));
   ['dragleave', 'drop'].forEach(t => zona.addEventListener(t, () => zona.classList.remove('encima')));
@@ -414,68 +476,73 @@ pantallas.enviar = async (refresco, extra = []) => {
     if (f.type.startsWith('image/') && modoActual() === 'file') form.querySelector('[name=modo][value=image]').click();
   }
 
-  // Probar conexión con /api/status del destino (vía el directorio de nodos)
-  $('#probar').addEventListener('click', async () => {
-    const dir = form.direccion.value.trim();
-    if (!dir) return;
-    $('#resultado-prueba').textContent = 'Probando…';
-    try {
-      const n = await api.post('/api/local/nodos', { direccion: dir });
-      $('#resultado-prueba').innerHTML = `${esc(n.nodoId)} · <strong>${esc(n.estado)}</strong> · certificado RSA ${n.tieneRsa ? '✓' : '✕'} · ECC ${n.tieneEcc ? '✓' : '✕'}`;
-    } catch (e) { $('#resultado-prueba').textContent = e.message; }
-  });
-
   form.addEventListener('submit', async e => {
     e.preventDefault();
+    const a = algActual();
+    const p = leerParametros(form);
     const fd = new FormData();
     fd.append('modo', modoActual());
-    fd.append('algoritmo', form.algoritmo.value);
-    fd.append('destinatario', form.destinatario.value);
-    fd.append('direccion', form.direccion.value.trim());
-    fd.append('soloGenerar', form.soloGenerar.checked ? 'true' : 'false');
+    fd.append('algoritmo', a.codigo);
+    fd.append('opciones', JSON.stringify(p.opciones));
+    fd.append('secretos', JSON.stringify(p.secretos));
+    if (p.keyId) fd.append('keyId', p.keyId);
+    if (p.cover) fd.append('cover', p.cover);
     if (modoActual() === 'text') {
-      if (!form.texto.value.trim()) return telegrama('Falta el mensaje', 'Escribe una frase para cifrar.', 'alerta');
+      if (!form.texto.value.trim()) return telegrama('Falta el mensaje', 'Escribe una frase.', 'alerta');
       fd.append('texto', form.texto.value);
     } else {
       if (!entrada.files[0]) return telegrama('Falta el archivo', 'Elige una imagen o archivo.', 'alerta');
       fd.append('archivo', entrada.files[0]);
     }
-    if (form.destinatario.value === 'pem') {
-      if (!form.certificado.files[0]) return telegrama('Falta el certificado', 'Sube el .pem del destinatario.', 'alerta');
-      fd.append('certificado', form.certificado.files[0]);
-    }
-    const boton = $('#btn-enviar');
-    boton.disabled = true; boton.textContent = 'Cifrando y firmando…';
+    const boton = $('#btn-op'), texto = boton.textContent;
+    boton.disabled = true; boton.textContent = a.propio ? 'Procesando y firmando…' : `Pidiendo a ${a.ejecutor}…`;
     try {
-      const r = await api.post('/api/local/enviar', fd);
-      const sello = form.soloGenerar.checked ? '<span class="sello sello--info">Generado</span>'
-        : r.ok ? `<span class="sello sello--ok">Entregado · ${r.codigoHttp}</span>`
-          : `<span class="sello sello--mal">No entregado${r.codigoHttp ? ' · ' + r.codigoHttp : ''}</span>`;
+      const r = await api.post('/api/local/forward', fd);
+      const c = r.consulta;
       $('#acuse').innerHTML = `
-        <div class="acuse">${sello}
-          <span class="etiqueta">Acuse</span><h2>${esc(r.mensaje)}</h2>
+        <div class="acuse"><span class="sello sello--ok">${r.delegado ? 'Delegado' : 'Local'} · ${esc(r.ejecutor)}</span>
+          <span class="etiqueta">Acuse · Consultas (Generado)</span><h2>${esc(a.forward)} con ${esc(a.codigo)} listo</h2>
           <dl>
-            <dt>Paquete</dt><dd class="mono">${esc(r.nombreZip)}</dd>
-            <dt>SHA-256 datos.enc</dt><dd>${hashHtml(r.sha256)}</dd>
-            <dt>Algoritmo</dt><dd>${chipAlg(form.algoritmo.value)}</dd>
+            <dt>Paquete</dt><dd class="mono">${esc(c.nombreZip)}</dd>
+            <dt>Productor</dt><dd>${esc(c.nodoProductor)}</dd>
+            <dt>SHA-256 datos.enc</dt><dd>${hashHtml(c.sha256)}</dd>
           </dl>
-          <div class="acciones">
-            <a class="btn" href="/api/local/consultas/${encodeURIComponent(r.consultaId)}/zip" download>Descargar .zip</a>
-            <a class="btn btn--sec" href="#/consultas/${encodeURIComponent(r.consultaId)}">Ver en Consultas</a>
+          <form class="acciones" id="f-mandar">
+            <input type="text" name="destino" list="dl-nodos" placeholder="EQ05 o 192.168.1.20:5005" required style="flex:1 1 220px;font-family:var(--f-mono)">
+            <datalist id="dl-nodos">${nodos.map(n => `<option value="${esc(n.nodeId)}">${esc(n.direccion)}</option>`).join('')}</datalist>
+            <button class="btn" type="submit">Mandar a su bandeja</button>
+          </form>
+          <div class="acciones" style="margin-top:10px">
+            <a class="btn btn--sec" href="/api/local/consultas/${encodeURIComponent(c.id)}/zip" download>Descargar .zip</a>
+            <a class="btn btn--sec" href="#/consultas/${encodeURIComponent(c.id)}">Ver en Consultas</a>
           </div>
         </div>`;
+      $('#f-mandar').addEventListener('submit', ev => mandarABandeja(ev, c.id));
       $('#acuse').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (err) {
-      telegrama('No se pudo enviar', err.message, 'mal');
+      telegrama('No se pudo', err.message, 'mal');
       $('#acuse').innerHTML = `<div class="acuse"><span class="sello sello--mal">Error</span><span class="etiqueta">Acuse</span><h2>${esc(err.message)}</h2></div>`;
     } finally {
-      boton.disabled = false;
-      boton.textContent = form.soloGenerar.checked ? 'Sellar y generar .zip' : 'Sellar y enviar';
+      boton.disabled = false; boton.textContent = texto;
     }
   });
+
+  alCambiarAlgoritmo();
 };
 
-/* ===== Solicitudes (bandeja del Modo Receptor) ===== */
+/** Envía un registro de Consultas a la bandeja de otro nodo (reempaquetado 9.6). */
+async function mandarABandeja(ev, consultaId) {
+  ev.preventDefault();
+  const boton = ev.target.querySelector('button');
+  boton.disabled = true;
+  try {
+    const x = await api.post(`/api/local/consultas/${consultaId}/enviar`, { destino: ev.target.destino.value.trim() });
+    telegrama(x.ok ? 'Entregado' : 'No se entregó', x.mensaje, x.ok ? 'ok' : 'mal');
+  } catch (err) { telegrama('No se entregó', err.message, 'mal'); }
+  boton.disabled = false;
+}
+
+/* ===== Solicitudes (bandeja del rol Receptor) ===== */
 let filtroSolicitudes = 'Pendiente';
 pantallas.solicitudes = async () => {
   const lista = await api.get('/api/local/solicitudes' + (filtroSolicitudes ? `?estado=${filtroSolicitudes}` : ''));
@@ -483,9 +550,9 @@ pantallas.solicitudes = async () => {
 
   pintar(`
     <div class="encabezado"><div>
-      <span class="etiqueta">Modo receptor · POST /api/requests/receive</span>
+      <span class="etiqueta">Rol receptor · POST /api/requests/receive</span>
       <h1>Solicitudes</h1>
-      <p>Paquetes que llegaron por la red. El nodo ya revisó la estructura, el SHA-256 y la firma X.509; tú decides si entran al archivo de Consultas.</p>
+      <p>Paquetes que llegaron por la red. El nodo ya pasó las 14 validaciones de la sección 13.1; tú decides si entran a Consultas.</p>
     </div></div>
     <div class="filtros" role="group" aria-label="Filtrar por estado">
       ${filtros.map(([v, t]) => `<button type="button" data-filtro="${v}" aria-pressed="${v === filtroSolicitudes}">${t}</button>`).join('')}
@@ -501,12 +568,13 @@ pantallas.solicitudes = async () => {
           <div class="oficio__cuerpo">
             <h3>${esc(s.nombreZip)}</h3>
             <div class="oficio__meta">
-              <span>De <strong>${esc(s.nodoOrigen)}</strong></span>
+              <span>De <strong>${esc(s.nodoOrigen)}</strong>${s.nodoProductor && s.nodoProductor !== s.nodoOrigen ? ` (producido por ${esc(s.nodoProductor)})` : ''}</span>
               <span>IP <code>${esc(s.origenIp)}</code></span>
-              <span>${chipAlg(s.algoritmoCodigo)} ${esc(s.algoritmoDescripcion)}</span>
+              <span>${chipAlg(s.algoritmoCodigo)} ${esc(s.operacionNombre)}</span>
               <span>${esc(nombreModo(s.modo))} · ${esc(s.nombreOriginal)} · ${tamano(s.tamanoOriginal)}</span>
               ${s.salto ? `<span>Rebote #${s.salto}</span>` : ''}
             </div>
+            ${s.verificacion === 'Inválida' ? `<p class="ayuda" style="color:var(--sello);margin-top:6px">${esc(s.detalle)}</p>` : ''}
           </div>
           <div class="oficio__lado">
             <div class="acciones">${selloVerif(s.verificacion)} ${s.estado !== 'Pendiente' ? selloEstado(s.estado) : ''}</div>
@@ -517,7 +585,7 @@ pantallas.solicitudes = async () => {
                 <button class="btn btn--ok btn--chico" data-aceptar="${esc(s.id)}">Aceptar</button>` : ''}
             </div>
           </div>
-        </article>`).join('') : `<div class="vacio"><strong>Bandeja vacía</strong>Cuando otra célula envíe un paquete a este nodo, aparecerá aquí con una alerta.</div>`}
+        </article>`).join('') : `<div class="vacio"><strong>Bandeja vacía</strong>Cuando otro nodo envíe un paquete a este, aparecerá aquí con una alerta.</div>`}
     </div>`);
 
   $$('[data-filtro]').forEach(b => b.addEventListener('click', () => { filtroSolicitudes = b.dataset.filtro; pantallas.solicitudes(); }));
@@ -525,7 +593,7 @@ pantallas.solicitudes = async () => {
     b.disabled = true;
     try {
       const r = await api.post(`/api/local/solicitudes/${b.dataset.aceptar}/aceptar`);
-      telegrama('Aceptada', 'Se guardó en Consultas.', 'ok', `#/consultas/${r.consultaId}`);
+      telegrama('Aceptada', 'Se guardó en Consultas (Recibido).', 'ok', `#/consultas/${r.consultaId}`);
     } catch (e) { telegrama('No se pudo aceptar', e.message, 'mal'); }
     pantallas.solicitudes();
   }));
@@ -538,29 +606,29 @@ pantallas.solicitudes = async () => {
   $$('[data-detalle]').forEach(b => b.addEventListener('click', () => abrirSolicitud(b.dataset.detalle)));
 };
 
-/* ===== Consultas (archivo principal) ===== */
+/* ===== Consultas ===== */
 pantallas.consultas = async (refresco, extra = []) => {
   const lista = await api.get('/api/local/consultas');
   pintar(`
     <div class="encabezado"><div>
       <span class="etiqueta">Base de datos local</span>
       <h1>Consultas</h1>
-      <p>Todo lo que este nodo recibió y aceptó, envió o generó. Abre un registro para descargarlo, descifrarlo, rebotarlo o reenviarlo.</p>
+      <p><b>Generado</b>: forward propio o delegado · <b>Recibido</b>: aceptado de la bandeja · <b>Resultado</b>: devuelto por un inverse. Abre un registro para descargarlo, hacer el inverse, mandarlo a otro nodo o ver su manifiesto.</p>
     </div></div>
     ${lista.length ? `
     <div class="tabla-envoltura"><table>
-      <thead><tr><th>Fecha</th><th>Origen</th><th>Paquete</th><th>Nodo</th><th>Contenido</th><th>Verificación</th></tr></thead>
+      <thead><tr><th>Fecha</th><th>Origen</th><th>Paquete</th><th>Productor</th><th>Contenido</th><th>Validación</th></tr></thead>
       <tbody>
         ${lista.map(c => `
           <tr data-id="${esc(c.id)}" tabindex="0">
             <td>${fecha(c.fechaUtc)}</td>
             <td><span class="origen origen--${esc(c.origen)}">${esc(c.origen)}</span>${c.salto ? ` <span class="ayuda">#${c.salto}</span>` : ''}</td>
             <td class="td-zip">${esc(c.nombreZip)}</td>
-            <td>${esc(c.nodoRemoto)}</td>
-            <td>${chipAlg(c.algoritmoCodigo)} ${esc(nombreModo(c.modo))}</td>
-            <td>${c.origen === 'Recibido' ? selloVerif(c.verificacion) : `<span class="ayuda">${esc(c.resultadoEnvio || 'firmado')}</span>`}</td>
+            <td>${esc(c.nodoProductor)}</td>
+            <td>${chipAlg(c.algoritmoCodigo)} ${esc(c.operacionNombre)} · ${esc(nombreModo(c.modo))}</td>
+            <td>${selloVerif(c.verificacion)}${c.resultadoEnvio ? `<div class="ayuda">→ ${esc(c.nodoRemoto)}: ${esc(c.resultadoEnvio)}</div>` : ''}</td>
           </tr>`).join('')}
-      </tbody></table></div>` : `<div class="vacio"><strong>Sin registros</strong>Acepta una solicitud o envía un paquete para empezar.</div>`}`);
+      </tbody></table></div>` : `<div class="vacio"><strong>Sin registros</strong>Acepta una solicitud o ejecuta un forward para empezar.</div>`}`);
 
   $$('tbody tr').forEach(tr => {
     tr.addEventListener('click', () => abrirConsulta(tr.dataset.id));
@@ -574,9 +642,9 @@ pantallas.verificador = async refresco => {
   if (refresco) return;
   pintar(`
     <div class="encabezado"><div>
-      <span class="etiqueta">Herramienta</span>
+      <span class="etiqueta">Herramienta · sección 13.1</span>
       <h1>Verificador de paquetes</h1>
-      <p>Revisa cualquier <code>.zip</code> del estándar (de cualquier equipo, con cualquier algoritmo) sin registrarlo: estructura, nombre, SHA-256, huella y firma del certificado.</p>
+      <p>Revisa cualquier <code>.zip</code> v2.0 (de cualquier equipo y algoritmo) sin registrarlo: estructura, manifiesto, hash, parámetros canónicos, certificado, huella, firma y fecha. Te dice el código de error exacto del Anexo B.</p>
     </div></div>
     <label class="soltar hoja" id="soltar-v">
       <input type="file" accept=".zip" id="zip-v">
@@ -599,69 +667,96 @@ pantallas.verificador = async refresco => {
     $('#reporte').innerHTML = '<p class="ayuda" style="margin-top:14px">Verificando…</p>';
     try {
       const r = await api.post('/api/local/verificar', fd);
-      if (!r.estructura) {
-        $('#reporte').innerHTML = `<div class="acuse"><span class="sello sello--mal">Malformado · 400</span><span class="etiqueta">${esc(r.nombre)}</span><h2>${esc(r.error)}</h2></div>`;
-        return;
-      }
+      const sello = r.valido
+        ? selloVerif(r.confianza && r.confianza.startsWith('E-') ? 'Inválida' : r.confianza || 'Firma OK')
+        : `<span class="sello sello--mal">${esc(r.codigo)} · ${r.status}</span>`;
       $('#reporte').innerHTML = `
-        <div class="acuse">${selloVerif(r.validacion.etiqueta)}
-          <span class="etiqueta">Reporte</span><h2 class="mono" style="font-size:15px;padding-right:130px;word-break:break-all">${esc(r.nombre)}</h2>
-          <div style="margin-top:16px">${listaChecks(r.validacion, r.nombreValido)}</div>
-          ${r.validacion.certificado ? bloqueCertificado(r.validacion.certificado) : ''}
-          <div class="cajon__seccion"><span class="etiqueta">manifest.json</span><pre class="json">${esc(JSON.stringify(r.manifiesto, null, 2))}</pre></div>
+        <div class="acuse">${sello}
+          <span class="etiqueta">Reporte</span><h2 class="mono" style="font-size:15px;padding-right:150px;word-break:break-all">${esc(r.nombre)}</h2>
+          <ul class="checks" style="margin-top:16px">
+            <li class="${r.valido ? '' : 'mal'}">${esc(r.detalle)}</li>
+            ${r.confianza ? `<li class="${r.confianza === 'Firma OK' ? '' : r.confianza.startsWith('E-') ? 'mal' : 'aviso'}">Confianza del remitente: ${esc(r.confianza)}</li>` : ''}
+            <li class="${r.nombreValido ? '' : 'aviso'}">${r.nombreValido ? 'Nombre con el formato 9.2' : 'El nombre no sigue [RES_]EQnn_ALG_YYYYMMDD_HHMMSS_SHA8.zip (es solo informativo)'}</li>
+          </ul>
+          ${r.certificado ? bloqueCertificado(r.certificado) : ''}
+          ${r.cadenaFirma ? `<div class="cajon__seccion"><span class="etiqueta">Cadena de firma (8.4)</span><pre class="json">${esc(r.cadenaFirma)}</pre></div>` : ''}
+          ${r.parametrosCanonicos != null ? `<div class="cajon__seccion"><span class="etiqueta">publicParameters canónicos (8.5)</span><pre class="json">${esc(r.parametrosCanonicos || '(vacío)')}</pre></div>` : ''}
+          ${r.manifiesto ? `<div class="cajon__seccion"><span class="etiqueta">manifest.json</span><pre class="json">${esc(JSON.stringify(r.manifiesto, null, 2))}</pre></div>` : ''}
         </div>`;
     } catch (e) { $('#reporte').innerHTML = `<p class="ayuda">${esc(e.message)}</p>`; }
   }
 };
 
-/* ===== Nodos ===== */
+/* ===== Nodos (directorio, sección 6) ===== */
 pantallas.nodos = async () => {
   const lista = await api.get('/api/local/nodos');
+  const estadoNodo = n => n.alerta ? '<span class="sello sello--mal sello--plano">¡Huella cambió!</span>'
+    : !n.huellaFijada ? '<span class="sello sello--pend sello--plano">Sin confirmar</span>'
+      : n.estado === 'online' ? '<span class="sello sello--ok sello--plano">En línea</span>'
+        : '<span class="sello sello--info sello--plano">Fuera de línea</span>';
   pintar(`
     <div class="encabezado"><div>
-      <span class="etiqueta">Conectividad entre dispositivos</span>
-      <h1>Directorio de células</h1>
-      <p>Registra la IP:Puerto de cada equipo. El nodo consulta su <code>/api/status</code> y, si lo publica, guarda su certificado para cifrarle.</p>
-    </div></div>
+      <span class="etiqueta">Conectividad entre dispositivos · anuncio UDP 5099 + escaneo + alta manual</span>
+      <h1>Directorio de nodos</h1>
+      <p>Los nodos aparecen solos por el anuncio UDP. Antes de usarlos se verifica <code>/api/status</code> y <code>/api/certificate</code>; tú confirmas la huella una vez (TOFU) y queda fijada.</p>
+    </div>
+    <button class="btn btn--sec" id="buscar">⟳ Buscar nodos (/24, puertos 5001–5020)</button></div>
     <form class="hoja acciones" id="form-nodo" style="align-items:flex-end">
-      <label style="flex:1 1 260px"><span class="etiqueta">IP:Puerto</span>
-        <input type="text" name="direccion" placeholder="192.168.1.20:5000" required style="font-family:var(--f-mono);margin-top:6px"></label>
-      <button class="btn" type="submit">Agregar y probar</button>
+      <label style="flex:1 1 260px"><span class="etiqueta">Alta manual · IP:Puerto</span>
+        <input type="text" name="destino" placeholder="192.168.1.20:5005" required style="font-family:var(--f-mono);margin-top:6px"></label>
+      <button class="btn" type="submit">Agregar y verificar</button>
     </form>
     <div style="margin-top:18px">
     ${lista.length ? `<div class="tabla-envoltura"><table>
-      <thead><tr><th>Nodo</th><th>Dirección</th><th>Estado</th><th>Certificados</th><th>Última respuesta</th><th></th></tr></thead>
+      <thead><tr><th>Nodo</th><th>Dirección</th><th>Estado</th><th>Algoritmos</th><th>Fuente · visto</th><th>Huella</th><th></th></tr></thead>
       <tbody>${lista.map(n => `
         <tr>
-          <td><strong>${esc(n.nodoId)}</strong></td>
+          <td><strong>${esc(n.nodeId)}</strong><div class="ayuda">Equipo ${n.equipo}</div></td>
           <td class="mono">${esc(n.direccion)}</td>
-          <td>${n.estado === 'en línea' ? '<span class="sello sello--ok sello--plano">En línea</span>' : `<span class="sello sello--mal sello--plano">${esc(n.estado)}</span>`}</td>
-          <td>${n.tieneRsa ? chipAlg('RSA') : ''} ${n.tieneEcc ? chipAlg('ECC') : ''} ${!n.tieneRsa && !n.tieneEcc ? '<span class="ayuda">no publica</span>' : ''}</td>
-          <td>${fecha(n.vistoUtc)}</td>
+          <td>${estadoNodo(n)}</td>
+          <td>${n.algoritmos.length ? n.algoritmos.map(chipAlg).join(' ') : '<span class="ayuda">ninguno</span>'}</td>
+          <td>${esc(n.fuente)}<div class="ayuda">${fecha(n.vistoUtc)}</div></td>
+          <td><div class="hash" style="max-width:230px">${huellaLegible(n.huellaPresentada)}</div>
+            ${n.alerta ? `<div class="ayuda" style="color:var(--sello)">Fijada: ${huellaLegible(n.huellaFijada)}</div>` : ''}</td>
           <td><div class="acciones" style="justify-content:flex-end">
-            <button class="btn btn--sec btn--chico" data-probar="${esc(n.direccion)}">Probar</button>
-            <a class="btn btn--chico" href="#/enviar/${encodeURIComponent(n.direccion)}">Enviar</a>
-            <button class="btn btn--mal btn--chico" data-quitar="${esc(n.direccion)}" aria-label="Quitar ${esc(n.nodoId)}">×</button></div></td>
+            ${!n.huellaFijada || n.alerta ? `<button class="btn btn--ok btn--chico" data-confirmar="${esc(n.nodeId)}">${n.alerta ? 'Aceptar nueva huella' : 'Confirmar huella'}</button>` : ''}
+            <button class="btn btn--sec btn--chico" data-probar="${esc(n.direccion)}">Verificar</button>
+            <button class="btn btn--mal btn--chico" data-quitar="${esc(n.nodeId)}" aria-label="Quitar ${esc(n.nodeId)}">×</button></div></td>
         </tr>`).join('')}</tbody></table></div>`
-      : `<div class="vacio"><strong>Sin células registradas</strong>Pide a cada equipo su IP (ipconfig / ip a) y el puerto donde corre su nodo.</div>`}
+      : `<div class="vacio"><strong>Sin nodos todavía</strong>Si la red bloquea el broadcast, usa “Buscar nodos” o el alta manual con la IP de cada equipo (ipconfig / ip a) y su puerto 5000 + número de equipo.</div>`}
     </div>`);
 
   $('#form-nodo').addEventListener('submit', async e => {
     e.preventDefault();
     try {
-      const n = await api.post('/api/local/nodos', { direccion: e.target.direccion.value });
-      telegrama(`${n.nodoId}`, `${n.direccion} · ${n.estado}`, n.estado === 'en línea' ? 'ok' : 'alerta');
-    } catch (err) { telegrama('Dirección inválida', err.message, 'mal'); }
+      const n = await api.post('/api/local/nodos', { destino: e.target.destino.value });
+      telegrama(n.nodo, n.mensaje + ' Confirma su huella.', 'ok');
+    } catch (err) { telegrama('No se pudo dar de alta', err.message, 'mal'); }
     pantallas.nodos();
   });
+  $('#buscar').addEventListener('click', async ev => {
+    ev.target.disabled = true; ev.target.textContent = 'Buscando… (puede tardar ~1 min)';
+    try {
+      const r = await api.post('/api/local/nodos/buscar');
+      telegrama('Búsqueda terminada', `${r.encontrados} nodo(s) respondieron.`, r.encontrados ? 'ok' : 'alerta');
+    } catch (err) { telegrama('Búsqueda', err.message, 'alerta'); }
+    pantallas.nodos();
+  });
+  $$('[data-confirmar]').forEach(b => b.addEventListener('click', async () => {
+    const n = lista.find(x => x.nodeId === b.dataset.confirmar);
+    if (!confirm(`¿La huella de ${n.nodeId} es esta?\n\n${n.huellaPresentada.match(/.{1,4}/g).join(' ')}\n\nCompárala con la que muestra su Panel (en persona o por un canal confiable).`)) return;
+    try { await api.post(`/api/local/nodos/${encodeURIComponent(n.nodeId)}/confirmar`); telegrama('Huella fijada', `${n.nodeId} ya es de confianza.`, 'ok'); }
+    catch (err) { telegrama('No se confirmó', err.message, 'mal'); }
+    pantallas.nodos();
+  }));
   $$('[data-probar]').forEach(b => b.addEventListener('click', async () => {
     b.disabled = true;
-    const n = await api.post('/api/local/nodos', { direccion: b.dataset.probar }).catch(e => ({ estado: e.message }));
-    telegrama(b.dataset.probar, n.estado, n.estado === 'en línea' ? 'ok' : 'alerta');
+    try { const n = await api.post('/api/local/nodos', { destino: b.dataset.probar }); telegrama(n.nodo, n.mensaje, 'ok'); }
+    catch (err) { telegrama(b.dataset.probar, err.message, 'alerta'); }
     pantallas.nodos();
   }));
   $$('[data-quitar]').forEach(b => b.addEventListener('click', async () => {
-    await api.del('/api/local/nodos?direccion=' + encodeURIComponent(b.dataset.quitar));
+    await api.del('/api/local/nodos/' + encodeURIComponent(b.dataset.quitar));
     pantallas.nodos();
   }));
 };
@@ -679,17 +774,17 @@ pantallas.ajustes = async refresco => {
     </div></div>
     <form id="form-ajustes" class="rejilla rejilla--2">
       <section class="hoja">
-        <h2 style="margin-bottom:14px">Recepción</h2>
-        <label class="interruptor campo"><input type="checkbox" name="aceptandoPaquetes" ${a.aceptandoPaquetes ? 'checked' : ''}> Aceptar paquetes de la red (<code>acceptingPackages</code>)</label>
-        <span class="etiqueta" style="display:block;margin:16px 0 8px">Algoritmos que se pueden descifrar</span>
+        <h2 style="margin-bottom:14px">Recepción y proveedor</h2>
+        <label class="interruptor campo"><input type="checkbox" name="aceptandoPaquetes" ${a.aceptandoPaquetes ? 'checked' : ''}> Aceptar paquetes en la bandeja (<code>acceptingPackages</code>)</label>
+        <span class="etiqueta" style="display:block;margin:16px 0 8px">Algoritmos propios que se atienden (forward / inverse)</span>
         <label class="interruptor"><input type="checkbox" name="alg" value="RSA" ${a.algoritmosHabilitados.includes('RSA') ? 'checked' : ''}> RSA</label>
         <label class="interruptor" style="margin-top:6px"><input type="checkbox" name="alg" value="ECC" ${a.algoritmosHabilitados.includes('ECC') ? 'checked' : ''}> ECC</label>
         <label class="interruptor" style="margin-top:16px"><input type="checkbox" name="adminRemoto" ${a.adminRemoto ? 'checked' : ''}> Administración remota (manejar el nodo desde el celular)</label>
-        <p class="ayuda">Apagado, solo esta computadora puede aceptar, rechazar o descifrar. Enciéndelo solo en una red de confianza.</p>
+        <p class="ayuda">Apagado, solo esta computadora puede aceptar, rechazar u operar. Enciéndelo solo en una red de confianza.</p>
       </section>
       <section class="hoja">
         <h2 style="margin-bottom:14px">Ping-pong</h2>
-        <label class="interruptor campo"><input type="checkbox" name="rebotarAutomatico" ${a.rebotarAutomatico ? 'checked' : ''}> Rebotar automáticamente las pelotas RSA/ECC dirigidas a este nodo</label>
+        <label class="interruptor campo"><input type="checkbox" name="rebotarAutomatico" ${a.rebotarAutomatico ? 'checked' : ''}> Rebotar automáticamente las pelotas RSA/ECC que lleguen a la bandeja</label>
         <div class="rejilla rejilla--2">
           <label class="campo"><span class="etiqueta">Máximo de rebotes</span><input type="number" name="maxRebotes" min="1" max="50" value="${a.maxRebotes}"></label>
           <label class="campo"><span class="etiqueta">Pausa entre rebotes (ms)</span><input type="number" name="pausaRebotesMs" min="0" max="10000" step="100" value="${a.pausaRebotesMs}"></label>
@@ -743,103 +838,92 @@ $('.cajon__cerrar').addEventListener('click', cerrarCajon);
 $('#velo').addEventListener('click', cerrarCajon);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') cerrarCajon(); });
 
-/** Lista de comprobaciones a partir de un ResultadoValidacion. */
-function listaChecks(v, nombreValido) {
-  const items = [
-    [true, 'Estructura: datos.enc, certificado.pem y manifest.json en la raíz'],
-    [v.integridadOk, `Integridad SHA-256 de datos.enc ${v.integridadOk ? 'coincide' : 'NO coincide'}`],
-    [v.huellaOk, `Huella del certificado ${v.huellaOk ? 'coincide con el manifiesto' : 'NO coincide'}`],
-    [v.firmaOk, `Firma digital: ${v.detalleFirma || (v.firmaOk ? 'válida' : 'inválida')}`],
-  ];
-  if (nombreValido === false) v.avisos = ['El nombre no sigue NODO_ALG_FECHA_HORA_SHA8.zip', ...(v.avisos || [])];
-  return `<ul class="checks">
-    ${items.map(([ok, t]) => `<li class="${ok ? '' : 'mal'}">${esc(t)}</li>`).join('')}
-    ${(v.errores || []).filter(e => !/firma|huella|SHA-256/i.test(e)).map(e => `<li class="mal">${esc(e)}</li>`).join('')}
-    ${(v.avisos || []).map(a => `<li class="aviso">${esc(a)}</li>`).join('')}
-  </ul>`;
-}
-
 function bloqueCertificado(c) {
-  return `<div class="cajon__seccion"><span class="etiqueta">Certificado del emisor</span>
+  return `<div class="cajon__seccion"><span class="etiqueta">Certificado del remitente</span>
     <div class="hoja" style="padding:14px 16px;box-shadow:none">
       <strong>${esc(c.sujeto)}</strong>
-      <div class="ayuda">Llave ${esc(c.tipoLlave)} · ${c.autofirmado ? 'autofirmado' : 'emitido por ' + esc(c.emisor)} · ${c.vigente ? 'vigente' : 'NO vigente'}
-        (${new Date(c.noAntes).toLocaleDateString('es-MX')} – ${new Date(c.noDespues).toLocaleDateString('es-MX')})</div>
-      <div class="hash" style="margin-top:6px">${esc(c.huella)}</div>
+      <div class="ayuda">Vigente del ${new Date(c.noAntes).toLocaleDateString('es-MX')} al ${new Date(c.noDespues).toLocaleDateString('es-MX')}</div>
+      <div class="hash" style="margin-top:6px">${huellaLegible(c.huella)}</div>
     </div></div>`;
 }
 
 async function abrirSolicitud(id) {
   const r = await api.get(`/api/local/solicitudes/${id}`);
-  const s = r.solicitud, v = r.detalle;
+  const s = r.solicitud;
   abrirCajon(`
     <span class="etiqueta">Solicitud · ${esc(s.estado)}</span>
     <h2 class="mono" style="font-size:15px;margin:6px 40px 12px 0;word-break:break-all">${esc(s.nombreZip)}</h2>
     <div class="acciones">${selloVerif(s.verificacion)} ${selloEstado(s.estado)}</div>
-    <div class="cajon__seccion"><span class="etiqueta">Verificación automática</span>${listaChecks(v)}</div>
-    ${v.certificado ? bloqueCertificado(v.certificado) : ''}
+    <div class="cajon__seccion"><span class="etiqueta">Validación 13.1</span><p>${esc(s.detalle)}</p></div>
     <div class="cajon__seccion"><span class="etiqueta">Remitente</span>
-      <p>${esc(s.nodoOrigen)} desde <code>${esc(s.origenIp)}</code>; responde a <code>${esc(s.direccionRespuesta || '—')}</code></p>
-      <p class="ayuda">Paquete ${esc(s.packetId)} · rally ${esc(s.rallyId.slice(0, 8))} · rebote #${s.salto}</p></div>`);
+      <p>${esc(s.nodoOrigen)} desde <code>${esc(s.origenIp)}</code>; responde a <code>${esc(s.direccionRespuesta || '—')}</code><br>
+      Productor: ${esc(s.nodoProductor)} · ${chipAlg(s.algoritmoCodigo)} ${esc(s.algoritmoNombre)} · ${esc(s.operacionNombre)}</p>
+      <p class="ayuda">packetId ${esc(s.packetId)} · rally ${esc((s.rallyId || '').slice(0, 8))} · rebote #${s.salto}</p></div>
+    ${r.manifiesto ? `<div class="cajon__seccion"><span class="etiqueta">manifest.json</span><pre class="json">${esc(JSON.stringify(r.manifiesto, null, 2))}</pre></div>` : ''}`);
 }
 
 async function abrirConsulta(id) {
-  const r = await api.get(`/api/local/consultas/${id}`);
+  const [r, nodos] = await Promise.all([api.get(`/api/local/consultas/${id}`), api.get('/api/local/nodos').catch(() => [])]);
   const c = r.consulta, v = r.validacion;
-  const puedeRebotar = c.origen === 'Recibido' && r.paraMi && r.descifrable;
+  const alg = { llave: r.llave, secretos: r.secretos, codigo: c.algoritmoCodigo, dueno: r.ejecutorInverse || '—' };
+  const necesitaSecretos = !r.esResultado && (r.secretos || []).length > 0;
+  const nombreInverse = r.esResultado ? 'Abrir resultado' : `${c.operacion === 'forward' ? 'Inverse' : 'Operar'} (${esc(r.ejecutorInverse || '?')})`;
   abrirCajon(`
     <span class="etiqueta">Consulta · ${esc(c.origen)}</span>
     <h2 class="mono" style="font-size:15px;margin:6px 40px 12px 0;word-break:break-all">${esc(c.nombreZip)}</h2>
-    <div class="acciones" style="margin-bottom:14px">${selloVerif(v.etiqueta)} ${chipAlg(c.algoritmoCodigo)}</div>
+    <div class="acciones" style="margin-bottom:14px">${selloVerif(c.verificacion)} ${chipAlg(c.algoritmoCodigo)} <span class="ayuda">${esc(c.operacionNombre)} · productor ${esc(c.nodoProductor)}</span></div>
     <div class="acciones">
       <a class="btn btn--chico" href="/api/local/consultas/${encodeURIComponent(c.id)}/zip" download>Descargar .zip</a>
-      <button class="btn btn--sec btn--chico" id="b-descifrar" ${r.descifrable && r.paraMi ? '' : 'disabled title="Solo se descifran paquetes RSA/ECC cifrados para este nodo"'}>Descifrar</button>
-      ${puedeRebotar ? `<button class="btn btn--ok btn--chico" id="b-rebotar">Rebotar a ${esc(c.nodoRemoto)} ↩</button>` : ''}
+    </div>
+
+    <div class="cajon__seccion"><span class="etiqueta">${r.esResultado ? 'Resultado cifrado para ' + esc(r.paraMi ? 'este nodo' : 'otro nodo') : 'Inverse (descifrar / verificar / extraer…)'}</span>
+      <form id="f-inverse">
+        ${necesitaSecretos ? camposParametros({ ...alg, secretos: r.secretos }, null).replace(/<p class="ayuda">Este algoritmo.*?<\/p>/, '') : ''}
+        <div class="acciones">
+          <button class="btn btn--sec btn--chico" type="submit" ${r.esResultado && !r.paraMi ? 'disabled' : ''}>${nombreInverse}</button>
+          ${c.origen === 'Recibido' && !r.esResultado ? `<button class="btn btn--ok btn--chico" type="button" id="b-rebotar">Rebotar a ${esc(c.nodoOrigen)} ↩</button>` : ''}
+        </div>
+      </form>
     </div>
     <div id="claro"></div>
-    <div class="cajon__seccion"><span class="etiqueta">Reenviar el .zip tal cual a otra IP</span>
-      <form class="acciones" id="f-reenviar">
-        <input type="text" name="direccion" placeholder="IP:Puerto" required style="flex:1 1 180px;font-family:var(--f-mono)">
-        <button class="btn btn--sec btn--chico" type="submit">Reenviar</button>
+
+    <div class="cajon__seccion"><span class="etiqueta">Mandar a la bandeja de otro nodo (reenvío 9.6)</span>
+      <form class="acciones" id="f-mandar">
+        <input type="text" name="destino" list="dl-nodos-c" placeholder="EQ05 o IP:Puerto" required style="flex:1 1 180px;font-family:var(--f-mono)">
+        <datalist id="dl-nodos-c">${nodos.map(n => `<option value="${esc(n.nodeId)}">${esc(n.direccion)}</option>`).join('')}</datalist>
+        <button class="btn btn--sec btn--chico" type="submit">Mandar</button>
       </form>
-      <p class="ayuda" style="margin-top:6px">Se conserva la firma del emisor original; el destino podrá verificar quién lo creó.</p></div>
-    <div class="cajon__seccion"><span class="etiqueta">Verificación</span>${listaChecks(v)}</div>
+      <p class="ayuda" style="margin-top:6px">Se conserva datos.enc, parámetros, keyRef y productor; cambia packetId, fecha, remitente (este nodo) y firma.</p></div>
+
+    <div class="cajon__seccion"><span class="etiqueta">Validación (sin ventana de tiempo)</span>
+      <ul class="checks"><li class="${v.valido ? '' : 'mal'}">${esc(v.codigo ? v.codigo + ': ' : '')}${esc(v.detalle)}</li></ul></div>
     ${v.certificado ? bloqueCertificado(v.certificado) : ''}
     <div class="cajon__seccion"><span class="etiqueta">Datos</span>
-      <p>${esc(nombreModo(c.modo))} · ${esc(c.nombreOriginal)} · ${tamano(c.tamanoOriginal)}<br>
-      ${c.origen === 'Recibido' ? 'De' : 'Para'} ${esc(c.nodoRemoto)} <code>${esc(c.direccion)}</code> · ${fecha(c.fechaUtc)}<br>
+      <p>${esc(nombreModo(c.modo))} · ${esc(c.nombreOriginal)} · ${tamano(c.tamanoOriginal)} · ${fecha(c.fechaUtc)}<br>
       SHA-256: ${hashHtml(c.sha256)}</p>
-      ${c.resultadoEnvio ? `<p>Resultado del envío: <strong>${esc(c.resultadoEnvio)}</strong></p>` : ''}</div>
+      ${c.resultadoEnvio ? `<p>Último envío a ${esc(c.nodoRemoto)} <code>${esc(c.direccion)}</code>: <strong>${esc(c.resultadoEnvio)}</strong></p>` : ''}</div>
+    <div class="cajon__seccion"><span class="etiqueta">Cadena de firma (8.4)</span><pre class="json">${esc(r.cadenaFirma)}</pre></div>
     <div class="cajon__seccion"><span class="etiqueta">manifest.json</span><pre class="json">${esc(JSON.stringify(r.manifiesto, null, 2))}</pre></div>`);
 
-  $('#b-descifrar')?.addEventListener('click', async () => {
+  $('#f-inverse').addEventListener('submit', async e => {
+    e.preventDefault();
+    const boton = e.target.querySelector('[type=submit]');
+    boton.disabled = true;
     try {
-      const d = await api.post(`/api/local/consultas/${id}/descifrar`);
-      let cuerpo;
-      if (d.modo === 'text') cuerpo = `<blockquote>${esc(d.texto)}</blockquote>`;
-      else if (d.mime.startsWith('image/')) cuerpo = `<img alt="Imagen descifrada" src="data:${esc(d.mime)};base64,${d.base64}">`;
-      else cuerpo = `<p>${esc(d.nombre)} · ${tamano(d.tamano)}</p>`;
-      const enlace = `data:${d.mime};base64,${d.base64}`;
-      $('#claro').innerHTML = `<div class="cajon__seccion"><span class="etiqueta">Contenido en claro</span>
-        <div class="claro">${cuerpo}</div>
-        <a class="btn btn--sec btn--chico" style="margin-top:8px" href="${esc(enlace)}" download="${esc(d.nombre)}">Guardar ${esc(d.nombre)}</a></div>`;
-    } catch (e) { telegrama('No se pudo descifrar', e.message, 'mal'); }
+      const d = await api.post(`/api/local/consultas/${id}/inverse`, { secretos: leerParametros(e.target).secretos });
+      $('#claro').innerHTML = htmlClaro(d);
+    } catch (err) { telegrama('No se pudo', err.message, 'mal'); }
+    boton.disabled = false;
   });
   $('#b-rebotar')?.addEventListener('click', async ev => {
     ev.target.disabled = true;
     try {
-      const x = await api.post(`/api/local/consultas/${id}/rebotar`);
+      const x = await api.post(`/api/local/consultas/${id}/rebotar`, { secretos: leerParametros($('#f-inverse')).secretos });
       telegrama(x.ok ? 'Pelota regresada' : 'No se pudo regresar', x.mensaje, x.ok ? 'ok' : 'mal');
     } catch (e) { telegrama('No se pudo rebotar', e.message, 'mal'); }
     ev.target.disabled = false;
   });
-  $('#f-reenviar').addEventListener('submit', async e => {
-    e.preventDefault();
-    try {
-      const x = await api.post(`/api/local/consultas/${id}/reenviar`, { direccion: e.target.direccion.value.trim() });
-      telegrama(x.ok ? 'Reenviado' : 'No se reenvió', x.mensaje, x.ok ? 'ok' : 'mal');
-    } catch (err) { telegrama('No se reenvió', err.message, 'mal'); }
-  });
+  $('#f-mandar').addEventListener('submit', ev => mandarABandeja(ev, id));
 }
 
 /* ------------------------------------------------------------------ Arranque */
@@ -847,8 +931,10 @@ async function abrirConsulta(id) {
 (async function iniciar() {
   try {
     const id = await api.get('/api/local/identidad');
+    nodoActual = id.nodoId;
     $('#nodo-id').textContent = id.nodoId;
     $('#nodo-dir').textContent = id.direccion;
+    $('.sello-mini').textContent = String(id.equipo).padStart(2, '0');
     actualizarContador(id.pendientes);
   } catch (e) {
     pintar(`<div class="vacio"><strong>Acceso restringido</strong>${esc(e.message)}</div>`);

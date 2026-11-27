@@ -1,227 +1,137 @@
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Nodo03.Core.Protocolo;
 
 namespace Nodo03.Core.Cripto;
 
 /// <summary>
-/// La "identidad digital" del nodo: dos pares de llaves y sus certificados X.509.
+/// Identidad del nodo según la sección 7 del estándar v2.0: UN certificado X.509 RSA-2048
+/// autofirmado con <c>CN=EQ03, OU=Equipo 03, O=Centro de Ciberseguridad, C=MX</c>.
 /// </summary>
 /// <remarks>
-/// <para><b>¿Por qué dos certificados?</b> Un certificado X.509 solo puede llevar UNA llave
-/// pública. Como al Equipo 3 le tocaron RSA y ECC, el nodo tiene:</para>
-/// <list type="bullet">
-///   <item><b>Certificado RSA-2048</b>: firma con RSA-PSS y recibe datos cifrados con RSA-OAEP.</item>
-///   <item><b>Certificado EC P-256</b>: firma con ECDSA y recibe datos cifrados con ECDH (ECIES).</item>
-/// </list>
-/// <para>Cada paquete lleva en <c>certificado.pem</c> el certificado que corresponde a su
-/// algoritmo, así el receptor sabe con qué llave pública verificar la firma.</para>
-///
-/// <para><b>Persistencia.</b> La primera vez que arranca el nodo se generan las llaves y se
-/// guardan en <c>datos/identidad/</c>:</para>
-/// <code>
-///   rsa.cert.pem  rsa.key.pem   (llave privada PKCS#8 CIFRADA con AES-256 + contraseña)
-///   ecc.cert.pem  ecc.key.pem
-/// </code>
-/// <para>Así la huella del certificado no cambia entre ejecuciones y los demás equipos
-/// pueden reconocer al Nodo 03.</para>
-///
-/// <para><b>Concurrencia.</b> Las instancias de <see cref="RSA"/> y <see cref="ECDsa"/> no
-/// garantizan ser seguras entre hilos. En lugar de compartir un objeto con candados, se
-/// guardan los PARÁMETROS de la llave y cada operación crea su propia instancia
-/// (<see cref="CrearRsaPrivada"/>, <see cref="CrearEcdsaPrivada"/>). Es barato y elimina
-/// condiciones de carrera cuando llegan muchos paquetes a la vez.</para>
+/// <para>Esta llave sirve para tres cosas: firmar manifiestos y peticiones (RSA-PSS), recibir
+/// sobres CC-ENV-1 (RSA-OAEP) y, opcionalmente, HTTPS. Es DISTINTA de las llaves de algoritmo
+/// (<c>keyId</c>, sección 12) que el nodo guarda como dueño de RSA y ECC.</para>
+/// <para>Se guarda en <c>datos/identidad/identidad.cert.pem</c> y <c>identidad.key.pem</c>; la
+/// privada va cifrada (PKCS#8 + AES-256-CBC + PBKDF2-SHA256, 100 000 iteraciones).</para>
+/// <para><b>Concurrencia:</b> se guardan los PARÁMETROS de la llave y cada operación crea su
+/// propia instancia de <see cref="RSA"/>, así varios hilos pueden firmar a la vez sin candados.</para>
 /// </remarks>
 public sealed class IdentidadNodo
 {
-    /// <summary>Id lógico del nodo, ej. "NODO-03".</summary>
     public string NodoId { get; }
+    public int Equipo { get; }
+    public X509Certificate2 Certificado { get; }
 
-    /// <summary>Certificado público RSA.</summary>
-    public X509Certificate2 CertificadoRsa { get; }
+    /// <summary>Huella SHA-256 del certificado (hex MAYÚSCULAS).</summary>
+    public string Huella { get; }
 
-    /// <summary>Certificado público de curva elíptica (P-256).</summary>
-    public X509Certificate2 CertificadoEcc { get; }
+    private readonly RSAParameters _privada;
 
-    // Parámetros privados en memoria (nunca salen del proceso ni van en el .zip).
-    private readonly RSAParameters _rsaPrivada;
-    private readonly ECParameters _eccPrivada;
-
-    private IdentidadNodo(string nodoId, X509Certificate2 certRsa, RSAParameters rsa,
-                          X509Certificate2 certEcc, ECParameters ecc)
+    private IdentidadNodo(int equipo, X509Certificate2 cert, RSAParameters privada)
     {
-        NodoId = nodoId;
-        CertificadoRsa = certRsa;
-        CertificadoEcc = certEcc;
-        _rsaPrivada = rsa;
-        _eccPrivada = ecc;
+        Equipo = equipo;
+        NodoId = Protocolo.Identificadores.NodoDeEquipo(equipo);
+        Certificado = cert;
+        Huella = Huellas.HuellaCertificado(cert);
+        _privada = privada;
     }
 
-    // Candado de proceso: evita que dos hilos generen llaves al mismo tiempo en el arranque.
-    private static readonly object CandadoCreacion = new();
+    private static readonly object Candado = new();
 
-    /// <summary>
-    /// Carga la identidad desde <paramref name="carpeta"/> o la crea si no existe.
-    /// </summary>
-    /// <param name="carpeta">Carpeta donde viven los .pem (se crea si no existe).</param>
-    /// <param name="nodoId">Id del nodo; va en el CN del certificado.</param>
-    /// <param name="contrasena">Contraseña con la que se cifran las llaves privadas en disco.</param>
-    public static IdentidadNodo CargarOCrear(string carpeta, string nodoId, string contrasena)
+    private static readonly PbeParameters CifradoLlave = new(PbeEncryptionAlgorithm.Aes256Cbc, HashAlgorithmName.SHA256, 100_000);
+
+    /// <summary>Carga la identidad o la genera. Si el CN guardado no es el del equipo, genera una nueva.</summary>
+    public static IdentidadNodo CargarOCrear(string carpeta, int equipo, string contrasena)
     {
-        lock (CandadoCreacion)
+        lock (Candado)
         {
             Directory.CreateDirectory(carpeta);
-            var (certRsa, rsa) = CargarOCrearRsa(carpeta, nodoId, contrasena);
-            var (certEcc, ecc) = CargarOCrearEcc(carpeta, nodoId, contrasena);
-            return new IdentidadNodo(nodoId, certRsa, rsa, certEcc, ecc);
+            var rutaCert = Path.Combine(carpeta, "identidad.cert.pem");
+            var rutaLlave = Path.Combine(carpeta, "identidad.key.pem");
+            var nodo = Protocolo.Identificadores.NodoDeEquipo(equipo);
+
+            if (File.Exists(rutaCert) && File.Exists(rutaLlave))
+            {
+                var cert = X509Certificate2.CreateFromPem(File.ReadAllText(rutaCert));
+                if (cert.GetNameInfo(X509NameType.SimpleName, false) == nodo && cert.NotAfter.ToUniversalTime() > DateTime.UtcNow)
+                {
+                    using var rsa = RSA.Create();
+                    rsa.ImportFromEncryptedPem(File.ReadAllText(rutaLlave), contrasena);
+                    return new IdentidadNodo(equipo, cert, rsa.ExportParameters(true));
+                }
+            }
+
+            using var nueva = RSA.Create(2048);
+            var certificado = CrearCertificado(nodo, equipo, nueva);
+            File.WriteAllText(rutaCert, certificado.ExportCertificatePem() + "\n");
+            File.WriteAllText(rutaLlave, nueva.ExportEncryptedPkcs8PrivateKeyPem(contrasena, CifradoLlave));
+            return new IdentidadNodo(equipo, certificado, nueva.ExportParameters(true));
         }
     }
 
-    /// <summary>Crea una identidad solo en memoria (pruebas unitarias).</summary>
-    public static IdentidadNodo CrearEnMemoria(string nodoId)
+    /// <summary>Identidad solo en memoria (pruebas).</summary>
+    public static IdentidadNodo CrearEnMemoria(int equipo)
     {
         using var rsa = RSA.Create(2048);
-        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        return new IdentidadNodo(nodoId,
-            CrearCertificadoRsa(nodoId, rsa), rsa.ExportParameters(true),
-            CrearCertificadoEcc(nodoId, ecdsa), ecdsa.ExportParameters(true));
+        return new IdentidadNodo(equipo, CrearCertificado(Protocolo.Identificadores.NodoDeEquipo(equipo), equipo, rsa), rsa.ExportParameters(true));
     }
 
-    // ------------------------------------------------------------------
-    // Acceso por código de algoritmo
-    // ------------------------------------------------------------------
-
-    /// <summary>Certificado que corresponde al algoritmo ("RSA" o "ECC").</summary>
-    public X509Certificate2 Certificado(string codigo) => codigo switch
+    /// <summary>Certificado con todos los atributos obligatorios de la tabla de la sección 7.</summary>
+    private static X509Certificate2 CrearCertificado(string nodo, int equipo, RSA rsa)
     {
-        CodigosAlgoritmo.Rsa => CertificadoRsa,
-        CodigosAlgoritmo.Ecc => CertificadoEcc,
-        _ => throw new NotSupportedException($"El Nodo 03 no tiene certificado para '{codigo}'."),
-    };
-
-    /// <summary>Certificado en formato PEM (-----BEGIN CERTIFICATE-----), listo para certificado.pem.</summary>
-    public string CertificadoPem(string codigo) => Certificado(codigo).ExportCertificatePem() + "\n";
-
-    /// <summary>Huella SHA-256 del certificado del algoritmo indicado.</summary>
-    public string Huella(string codigo) => Huellas.HuellaCertificado(Certificado(codigo));
-
-    /// <summary>¿La huella dada corresponde a alguno de mis certificados?</summary>
-    public bool EsMiHuella(string? huella) =>
-        Huellas.HuellasIguales(huella, Huella(CodigosAlgoritmo.Rsa)) ||
-        Huellas.HuellasIguales(huella, Huella(CodigosAlgoritmo.Ecc));
-
-    /// <summary>Nueva instancia RSA con la llave privada (el que llama debe hacer Dispose).</summary>
-    public RSA CrearRsaPrivada()
-    {
-        var rsa = RSA.Create();
-        rsa.ImportParameters(_rsaPrivada);
-        return rsa;
-    }
-
-    /// <summary>Nueva instancia ECDSA con la llave privada (para firmar).</summary>
-    public ECDsa CrearEcdsaPrivada() => ECDsa.Create(_eccPrivada);
-
-    /// <summary>
-    /// La MISMA llave EC vista como ECDH (para el acuerdo de claves al descifrar).
-    /// Por eso el certificado EC declara KeyUsage = DigitalSignature + KeyAgreement.
-    /// </summary>
-    public ECDiffieHellman CrearEcdhPrivada() => ECDiffieHellman.Create(_eccPrivada);
-
-    // ------------------------------------------------------------------
-    // Generación y persistencia
-    // ------------------------------------------------------------------
-
-    /// <summary>
-    /// Nombre distintivo (DN) del certificado. Va en el Subject y en el Issuer
-    /// (es autofirmado). Cualquier lenguaje puede leerlo.
-    /// </summary>
-    private static X500DistinguishedName NombreDistintivo(string nodoId, string tipo) =>
-        new($"CN={nodoId} {tipo}, OU=Equipo 3, O=Centro de Ciberseguridad UPIICSA, C=MX");
-
-    private static X509Certificate2 CrearCertificadoRsa(string nodoId, RSA rsa)
-    {
-        // La autofirma del certificado usa PKCS#1 v1.5 (sha256WithRSAEncryption): es el
-        // formato que TODAS las librerías saben leer. RSA-PSS se usa para el manifiesto.
-        var req = new CertificateRequest(NombreDistintivo(nodoId, "RSA"), rsa,
-            HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        AgregarExtensiones(req, X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment);
-        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(2));
-    }
-
-    private static X509Certificate2 CrearCertificadoEcc(string nodoId, ECDsa ecdsa)
-    {
-        var req = new CertificateRequest(NombreDistintivo(nodoId, "ECC"), ecdsa, HashAlgorithmName.SHA256);
-        AgregarExtensiones(req, X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyAgreement);
-        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(2));
-    }
-
-    private static void AgregarExtensiones(CertificateRequest req, X509KeyUsageFlags usos)
-    {
-        // No es una CA: no puede firmar otros certificados.
+        var sujeto = new X500DistinguishedName($"CN={nodo}, OU=Equipo {equipo:D2}, O=Centro de Ciberseguridad, C=MX");
+        var req = new CertificateRequest(sujeto, rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); // sha256WithRSAEncryption
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-        // Para qué sirve la llave (crítica = el verificador debe respetarla).
-        req.CertificateExtensions.Add(new X509KeyUsageExtension(usos, true));
-        // Identificador de la llave (útil para depurar y para cadenas futuras).
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
         req.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(req.PublicKey, false));
+
+        // Número de serie aleatorio de 128 bits (≥ 64 bits), positivo y sin cero inicial.
+        var serie = RandomNumberGenerator.GetBytes(16);
+        serie[0] = (byte)((serie[0] & 0x7F) | 0x40);
+
+        var ahora = DateTimeOffset.UtcNow;
+        // Se adelanta el inicio 10 min para tolerar relojes de otros equipos (ventana de ±10 min).
+        return req.Create(sujeto, X509SignatureGenerator.CreateForRSA(rsa, RSASignaturePadding.Pkcs1),
+            ahora.AddMinutes(-10), ahora.AddDays(365), serie);
     }
 
-    /// <summary>Parámetros de cifrado de la llave privada en disco: AES-256-CBC + PBKDF2-SHA256 (100 000 iteraciones).</summary>
-    private static readonly PbeParameters CifradoLlave =
-        new(PbeEncryptionAlgorithm.Aes256Cbc, HashAlgorithmName.SHA256, 100_000);
+    public string CertificadoPem => Certificado.ExportCertificatePem() + "\n";
 
-    private static (X509Certificate2, RSAParameters) CargarOCrearRsa(string carpeta, string nodoId, string pass)
+    /// <summary>Firma RSA-PSS-SHA256 (sal de 32 bytes) con la llave de identidad.</summary>
+    public byte[] Firmar(byte[] datos)
     {
-        var rutaCert = Path.Combine(carpeta, "rsa.cert.pem");
-        var rutaLlave = Path.Combine(carpeta, "rsa.key.pem");
-        if (File.Exists(rutaCert) && File.Exists(rutaLlave))
-        {
-            using var rsa = RSA.Create();
-            rsa.ImportFromEncryptedPem(File.ReadAllText(rutaLlave), pass);
-            return (X509Certificate2.CreateFromPem(File.ReadAllText(rutaCert)), rsa.ExportParameters(true));
-        }
-        using var nueva = RSA.Create(2048);
-        var cert = CrearCertificadoRsa(nodoId, nueva);
-        File.WriteAllText(rutaCert, cert.ExportCertificatePem());
-        File.WriteAllText(rutaLlave, nueva.ExportEncryptedPkcs8PrivateKeyPem(pass, CifradoLlave));
-        return (cert, nueva.ExportParameters(true));
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(_privada);
+        return rsa.SignData(datos, HashAlgorithmName.SHA256, RSASignaturePadding.Pss);
     }
 
-    private static (X509Certificate2, ECParameters) CargarOCrearEcc(string carpeta, string nodoId, string pass)
+    /// <summary>Abre la CEK de un sobre CC-ENV-1 (RSA-OAEP-SHA256).</summary>
+    public byte[] Desenvolver(byte[] envuelta)
     {
-        var rutaCert = Path.Combine(carpeta, "ecc.cert.pem");
-        var rutaLlave = Path.Combine(carpeta, "ecc.key.pem");
-        if (File.Exists(rutaCert) && File.Exists(rutaLlave))
-        {
-            using var ec = ECDsa.Create();
-            ec.ImportFromEncryptedPem(File.ReadAllText(rutaLlave), pass);
-            return (X509Certificate2.CreateFromPem(File.ReadAllText(rutaCert)), ec.ExportParameters(true));
-        }
-        using var nueva = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var cert = CrearCertificadoEcc(nodoId, nueva);
-        File.WriteAllText(rutaCert, cert.ExportCertificatePem());
-        File.WriteAllText(rutaLlave, nueva.ExportEncryptedPkcs8PrivateKeyPem(pass, CifradoLlave));
-        return (cert, nueva.ExportParameters(true));
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(_privada);
+        return rsa.Decrypt(envuelta, RSAEncryptionPadding.OaepSHA256);
     }
+
+    /// <summary>Lee un certificado PEM (texto o bytes).</summary>
+    public static X509Certificate2 LeerPem(string pem) => X509Certificate2.CreateFromPem(pem.Trim('﻿', ' ', '\r', '\n', '\t'));
+    public static X509Certificate2 LeerPem(byte[] pem) => LeerPem(Encoding.UTF8.GetString(pem));
 
     /// <summary>
-    /// Lee un certificado PEM de otro nodo. Acepta el texto con o sin saltos de línea
-    /// al final y con BOM. Lanza <see cref="CryptographicException"/> si no es válido.
+    /// Revisa que un certificado ajeno cumpla la sección 7 (validación 10 de 13.1):
+    /// X.509 RSA-2048, CN = <paramref name="nodoEsperado"/>, vigente. Devuelve el problema o null.
     /// </summary>
-    public static X509Certificate2 LeerCertificadoPem(string pem)
+    public static string? ProblemaCertificado(X509Certificate2 cert, string nodoEsperado, DateTime ahoraUtc)
     {
-        var limpio = pem.Trim('﻿', ' ', '\r', '\n', '\t');
-        return X509Certificate2.CreateFromPem(limpio);
-    }
-
-    /// <summary>Lee un certificado PEM desde bytes UTF-8.</summary>
-    public static X509Certificate2 LeerCertificadoPem(byte[] pem) => LeerCertificadoPem(Encoding.UTF8.GetString(pem));
-
-    /// <summary>"RSA", "ECC" o null según el tipo de llave pública del certificado.</summary>
-    public static string? TipoDeLlave(X509Certificate2 cert)
-    {
-        if (cert.GetRSAPublicKey() is { } r) { r.Dispose(); return CodigosAlgoritmo.Rsa; }
-        if (cert.GetECDsaPublicKey() is { } e) { e.Dispose(); return CodigosAlgoritmo.Ecc; }
+        using var rsa = cert.GetRSAPublicKey();
+        if (rsa is null) return "La llave del certificado no es RSA.";
+        if (rsa.KeySize != 2048) return $"La llave es RSA-{rsa.KeySize}; el estándar pide RSA-2048.";
+        var cn = cert.GetNameInfo(X509NameType.SimpleName, false);
+        if (cn != nodoEsperado) return $"El CN del certificado es '{cn}' y debería ser '{nodoEsperado}'.";
+        if (ahoraUtc < cert.NotBefore.ToUniversalTime() || ahoraUtc > cert.NotAfter.ToUniversalTime())
+            return "El certificado no está vigente.";
         return null;
     }
 }

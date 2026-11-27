@@ -1,5 +1,5 @@
 /* =====================================================================
-   Nodo 03 · Oficialía de Partes Cifrada
+   Nodo EQ03 · Oficialía de Partes Cifrada (v2.0)
    ---------------------------------------------------------------------
    Concepto visual: una oficialía de partes (la ventanilla de gobierno
    que recibe oficios y les pone sello de "Recibido"). Cada paquete .zip
@@ -7,8 +7,8 @@
    envió. Por eso:
      - Fondo de papel de archivo y tinta azul marino (no el típico
        "dashboard negro de hacker").
-     - Los resultados de verificación son SELLOS de goma: verde "X.509 OK",
-       rojo "INVÁLIDA", ámbar "PENDIENTE".
+     - Los resultados de verificación son SELLOS de goma: verde "Firma OK",
+       rojo "Inválida", ámbar "Remitente no confirmado" / "Pendiente".
      - Los hashes van en tipografía monoespaciada, con los primeros 8
        caracteres resaltados porque son el SHA8 del nombre del zip.
    Sin fuentes externas: solo tipografías del sistema (funciona offline).
@@ -144,6 +144,7 @@ main:focus { outline: none; }
 .rejilla { display: grid; gap: 18px; }
 .rejilla--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .rejilla--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.rejilla--4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .rejilla--panel { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); align-items: start; }
 
 /* Cifras del panel */
@@ -338,6 +339,17 @@ tbody tr:last-child td { border-bottom: 0; }
 .origen--Recibido { background: var(--verde-fondo); color: var(--verde); }
 .origen--Enviado { background: var(--azul-fondo); color: var(--azul); }
 .origen--Generado { background: var(--papel-2); color: var(--tinta-2); }
+.origen--Resultado { background: var(--ambar-fondo); color: var(--ambar); }
+
+/* Los 21 algoritmos (v2.0): tarjetas compactas; las no disponibles se ven apagadas */
+.algoritmos--21 { grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; }
+.algoritmos--21 .algoritmo > div { padding: 10px 12px; }
+.algoritmos--21 .algoritmo b { font-size: 17px; word-break: break-all; }
+.algoritmos--21 .algoritmo small { font-size: 12px; margin-top: 2px; }
+.algoritmo__estado { color: var(--verde) !important; font-weight: 600; }
+.algoritmo--no { opacity: .55; }
+.algoritmo--no .algoritmo__estado { color: var(--tinta-3) !important; }
+.claro p.mal { color: var(--sello); }
 
 /* ---------------------------------------------------------------------
    Cajón lateral (panel desplegable de Consultas)
@@ -354,7 +366,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .cajon__seccion > .etiqueta { display: block; margin-bottom: 8px; }
 pre.json {
   background: var(--tinta); color: #DCE3EE; padding: 14px; border-radius: var(--radio); font: 12px/1.5 var(--f-mono);
-  overflow: auto; max-height: 300px; margin: 0;
+  overflow: auto; max-height: 300px; margin: 0; white-space: pre-wrap; word-break: break-all;
 }
 
 /* Lista de comprobaciones (verificación) */
@@ -424,6 +436,7 @@ pre.json {
    --------------------------------------------------------------------- */
 @media (max-width: 980px) {
   .rejilla--panel, .rejilla--3 { grid-template-columns: minmax(0, 1fr); }
+  .rejilla--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   :root { --ancho-carpeta: 0px; }
@@ -446,6 +459,7 @@ pre.json {
   main { padding: 20px 16px 110px; }
   h1 { font-size: 24px; }
   .rejilla--2, .algoritmos { grid-template-columns: minmax(0, 1fr); }
+  .algoritmos--21 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .oficio { grid-template-columns: 1fr; }
   .oficio__talon { flex-direction: row; align-items: center; border-right: 0; border-bottom: 2px dashed var(--linea); }
   .oficio__lado { align-items: flex-start; flex-direction: row; flex-wrap: wrap; }

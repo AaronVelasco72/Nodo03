@@ -1,47 +1,54 @@
-# 5. Manual de uso y guion de demo
+# 5. Manual de uso y guion de demo (estándar v2.0)
 
 ## 5.1 Pantallas
 
 | Pantalla | Para qué |
 | --- | --- |
-| **Panel** | Credencial del nodo (huellas de los certificados RSA y ECC, descarga de `.pem`), contadores, rallies de ping-pong y bitácora en vivo. |
-| **Enviar** | Modo emisor en 3 pasos: contenido (frase, imagen o archivo) → algoritmo (RSA o ECC) → destino (IP:Puerto y para quién se cifra). Al final muestra el **acuse** con el nombre oficial del zip, el SHA-256 y el código HTTP del destino. |
-| **Solicitudes** | Bandeja del modo receptor. Cada paquete aparece como un oficio con folio (SHA8), remitente, algoritmo y sello `X.509 OK` o `Inválida`. Botones **Aceptar** / **Rechazar** y **Detalle** con la verificación completa. |
-| **Consultas** | Base de datos local. Al abrir un registro se despliega el panel lateral con **Descargar**, **Descifrar** (muestra el texto o la imagen), **Rebotar** (ping-pong) y **Reenviar** a otra IP. |
-| **Verificador** | Arrastra cualquier `.zip` (de cualquier equipo) y ve el reporte sin registrarlo. |
-| **Nodos** | Directorio de células: agrega IP:Puerto, prueba `/api/status` y guarda sus certificados. |
-| **Ajustes** | Aceptar paquetes sí/no, algoritmos habilitados para descifrar, ping-pong automático (máximo de rebotes y pausa), administración remota, sonido y notificaciones del sistema. |
+| **Panel** | Credencial del nodo (sujeto y huella del certificado, descarga del `.pem`), llaves `keyId`, contadores, estado del anuncio UDP, rallies de ping-pong y bitácora en vivo. |
+| **Operar** | Forward con **cualquiera de los 21 algoritmos**: contenido (frase, imagen o archivo) → algoritmo (cada tarjeta dice si es local, a quién se delega o por qué no está disponible) → parámetros (se arman con el perfil `/api/algorithms` del dueño; secretos en campos de contraseña) → acuse con el zip y el botón **Mandar a su bandeja**. |
+| **Solicitudes** | Bandeja: remitente, IP, zip, algoritmo, `operationName` y sello **Firma OK** / **Remitente no confirmado** / **Inválida** (con el código de error). **Aceptar** / **Rechazar** / **Detalle** (manifiesto). |
+| **Consultas** | Orígenes **Generado**, **Recibido** y **Resultado**. Panel lateral: descargar, **Inverse** (local o delegado; pide los secretos si el algoritmo los usa), **Rebotar**, **Mandar a otro nodo** (reenvío 9.6), cadena de firma y manifiesto. |
+| **Verificador** | Arrastra cualquier `.zip` v2.0 y te da el código exacto del Anexo B, la cadena 8.4 y los parámetros canónicos 8.5. |
+| **Nodos** | Directorio: los nodos llegan solos por UDP; **Buscar nodos** (escaneo) y **alta manual**. **Confirmar huella** (TOFU) y alerta roja si cambia. |
+| **Ajustes** | Aceptar paquetes, algoritmos propios habilitados, ping-pong automático (máximo y pausa), administración remota, sonido y notificaciones. |
 
-**Alertas.** Al llegar un paquete suena un timbre, aparece un aviso arriba a la derecha, sube el contador rojo de Solicitudes, cambia el título de la pestaña y, si diste permiso, sale una notificación del sistema aunque el navegador esté minimizado.
-
-**Celular.** Abre `http://IP-de-la-PC:5000` desde el teléfono (misma red). Para aceptar o descifrar desde ahí activa *Ajustes → Administración remota*.
+**Alertas.** Al llegar un paquete: timbre, aviso, contador rojo, título de la pestaña y notificación del sistema (si se dio
+permiso). También avisa cuando aparece un nodo nuevo o cuando un nodo cambia de certificado.
 
 ## 5.2 Preparación el día de la presentación
 
-1. Todas las computadoras en la **misma red** (el mismo Wi-Fi o un hotspot del celular; algunas redes escolares aíslan a los clientes entre sí).
-2. `dotnet run --project src/Nodo03.Web -c Release`. Si Windows pregunta, **permitir en redes privadas**.
-3. Anotar la dirección que imprime la consola (`En la LAN: http://192.168.x.x:5000`). Si muestra una IP rara (VirtualBox, WSL), arrancar con `--Nodo:DireccionPublica=192.168.x.x:5000`.
-4. En **Nodos**, registrar la IP:Puerto de cada equipo y confirmar "En línea".
-5. Compartir las huellas de los certificados (Panel) con los demás equipos.
+1. Todas las computadoras en la **misma red** (router o hotspot propio; las redes escolares suelen bloquear broadcast).
+2. `dotnet run --project src/Nodo03.Web -c Release` → `http://localhost:5003`. Permitir **Redes privadas** en el firewall
+   (TCP 5003 y UDP 5099).
+3. Si la consola muestra una IP rara (VirtualBox, WSL), arrancar con `--Nodo:IpPublica=192.168.x.x`.
+4. En **Nodos**: esperar los anuncios (≤ 30 s) o **Buscar nodos**; comparar en persona la huella de cada equipo con su
+   Panel y **Confirmar**.
+5. Dar a los demás nuestra huella (Panel) para que nos confirmen.
 
 ## 5.3 Guion de demo (8 minutos)
 
-1. **Generar un archivo con certificado** (lo que pidió el profesor para todos los módulos). Enviar → Frase "CURP VERA040101HDFLMR09…" → RSA → *Para mí* + *Solo generar*. Descargar el zip, abrirlo y mostrar los 3 archivos. Abrir `certificado.pem` con doble clic en Windows: se lee en cualquier lado.
-2. **Verificar desde otro lenguaje.** `python herramientas/verificar_paquete.py <zip>` → `X.509 OK`.
-3. **Envío a otra célula.** Enviar → Imagen → ECC → destino IP del equipo vecino → *Para el nodo destino*. Mostrar el acuse "Entregado · 202".
-4. **Recepción y alerta.** Que otro equipo nos envíe un paquete: suena la alerta, aparece en Solicitudes con su sello. Abrir Detalle → checklist SHA-256 / huella / firma.
-5. **Ataque en vivo.** Abrir un zip recibido, cambiar un carácter de `datos.enc` con un editor y subirlo al Verificador (o enviarlo con curl): sello **Inválida**, error de integridad. Con curl el nodo responde **422**.
-6. **Ping-pong.** Aceptar la pelota → Consultas → Descifrar (se ve el contenido) → **Rebotar**: se re-cifra con el certificado del emisor y regresa a su IP. En el Panel se ve el rally con los rebotes numerados.
-7. **Ping-pong automático entre dos nodos** (los dos del Equipo 3 o con otro equipo que también use RSA/ECC): activar en Ajustes, enviar una pelota y ver cómo rebota sola hasta el máximo configurado.
-8. **Pruebas.** `dotnet test` → 110 pruebas en verde, incluidas las de concurrencia.
+1. **Descubrimiento.** Abrir Nodos: aparecen los equipos por UDP; confirmar una huella.
+2. **Algoritmo propio.** Operar → Frase → RSA → acuse con `EQ03_RSA_…zip` y su `keyId`. Descargar el zip y mostrar los
+   3 archivos; `python herramientas/verificar_paquete.py <zip>` → VÁLIDO desde Python.
+3. **Delegación.** Operar → AESGCM (dueño EQ01) con su clave → el acuse dice "Delegado · EQ01".
+4. **Bandeja.** Mandar el paquete a la bandeja del vecino; que el vecino nos mande uno: suena la alerta, sello **Firma OK**.
+5. **Inverse.** Aceptar → Consultas → Inverse: si es RSA/ECC se hace aquí; si es de otro equipo, se le pide a su dueño y
+   regresa como **Resultado** cifrado para nosotros.
+6. **Ataque.** Cambiar un byte de `datos.enc` y subirlo al Verificador → `E-HASH`; cambiar `producerNode` → `E-SIGNATURE`;
+   reenviar el mismo zip → `409 E-DUPLICATE`.
+7. **Ping-pong automático** (EQ03 ↔ otro nodo, o EQ03 ↔ EQ13 local): activar en Ajustes y ver el rally en el Panel.
+8. **Interoperabilidad y pruebas.** `python herramientas/cliente_v2.py <IP>:5003 "Hola"` y `dotnet test` → 102 en verde.
 
 ## 5.4 Problemas comunes
 
 | Síntoma | Causa probable | Solución |
 | --- | --- | --- |
-| "No se pudo conectar con el destino" | Firewall, IP equivocada o red con aislamiento de clientes | Permitir `dotnet` en el firewall; `ping` a la IP; usar hotspot |
-| "El destino no publicó su certificado" | El otro nodo no implementa `/api/certificate` | Pedir su `.pem` y usar *Para un certificado que subo*, o cifrar *Para mí* si solo van a validar |
-| 403 al abrir la interfaz desde el celular | La administración remota está apagada | Activarla en Ajustes desde la PC |
-| "Este paquete fue cifrado para otro certificado" | Se intenta descifrar algo cifrado para otro nodo | Solo el destinatario puede descifrar; es el comportamiento correcto |
-| Se perdieron las llaves al cambiar de carpeta | La identidad vive en `datos/identidad` | Copiar la carpeta `datos` completa; no subirla a GitHub |
+| No aparecen nodos | La red bloquea broadcast o el firewall bloquea UDP 5099 | **Buscar nodos** o alta manual; abrir UDP 5099 |
+| "Confirma la huella de EQxx" | Nodo encontrado pero sin TOFU | Nodos → Confirmar huella |
+| "EQxx presenta una huella distinta" | Regeneró su certificado (o alguien lo suplanta) | Verificar en persona y **Aceptar nueva huella** |
+| `E-TIMESTAMP` | Relojes desfasados más de 10 min | Sincronizar la hora (Windows: Configuración → Hora → Sincronizar ahora) |
+| `E-CERT-UNTRUSTED` (403) al mandar | El otro nodo tiene fijada otra huella nuestra | Que nos vuelva a confirmar |
+| `E-BUSY` (503) | El nodo no acepta paquetes o hay 10 operaciones en curso | Revisar Ajustes / reintentar |
+| 403 al abrir la interfaz desde el celular | Administración remota apagada | Activarla en Ajustes desde la PC |
+| Se perdieron las llaves `keyId` | Se borró o cambió la carpeta `datos` | Copiar `datos` completa (nunca subirla a GitHub) |
 | `DllNotFoundException: sqlite` en Linux | Falta la librería del sistema | `sudo apt install libsqlite3-0` |

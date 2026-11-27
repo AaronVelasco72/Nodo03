@@ -10,11 +10,12 @@ public sealed class RepositorioTests : IDisposable
 
     public RepositorioTests() => _repo = new RepositorioNodo(new BaseDatos(_ruta));
 
-    private static Solicitud Nueva(string packetId) => new()
+    private static Solicitud Nueva(string packetId, string verificacion = Verificaciones.FirmaOk) => new()
     {
-        PacketId = packetId, NombreZip = "X.zip", OrigenIp = "1.1.1.1", NodoOrigen = "NODO-01",
-        DireccionRespuesta = "1.1.1.1:5000", AlgoritmoCodigo = "RSA", Algoritmo = "RSA", Modo = "text",
-        NombreOriginal = "m.txt", Sha256 = "ab", Verificacion = "X.509 OK", RutaZip = "/tmp/x.zip",
+        PacketId = packetId, NombreZip = "EQ05_RSA_20261127_120000_ABCDEF12.zip", OrigenIp = "1.1.1.1", NodoOrigen = "EQ05",
+        NodoProductor = "EQ03", DireccionRespuesta = "1.1.1.1:5005", AlgoritmoCodigo = "RSA", AlgoritmoNombre = "RSA-OAEP",
+        Operacion = "forward", OperacionNombre = "cifrar", Modo = "text", NombreOriginal = "m.txt", Sha256 = "ab",
+        Verificacion = verificacion, RutaZip = "/tmp/x.zip",
     };
 
     [Fact]
@@ -22,7 +23,18 @@ public sealed class RepositorioTests : IDisposable
     {
         Assert.True(_repo.InsertarSolicitud(Nueva("p1")));
         Assert.False(_repo.InsertarSolicitud(Nueva("p1")));
+        Assert.True(_repo.ExistePaquete("p1"));
         Assert.Single(_repo.ListarSolicitudes());
+    }
+
+    [Fact]
+    public void PaquetesInvalidos_SeGuardanComoEvidencia_SinBloquearAlValido()
+    {
+        // Un intento inválido con el mismo packetId no impide que luego llegue el bueno.
+        Assert.True(_repo.InsertarSolicitud(Nueva("p9", Verificaciones.Invalida)));
+        Assert.False(_repo.ExistePaquete("p9"));
+        Assert.True(_repo.InsertarSolicitud(Nueva("p9")));
+        Assert.Equal(2, _repo.ListarSolicitudes().Count);
     }
 
     [Fact]
@@ -33,6 +45,8 @@ public sealed class RepositorioTests : IDisposable
         var c = _repo.Aceptar(s.Id);
         Assert.NotNull(c);
         Assert.Equal(OrigenesConsulta.Recibido, c!.Origen);
+        Assert.Equal("EQ03", c.NodoProductor);
+        Assert.Equal("cifrar", c.OperacionNombre);
         Assert.Null(_repo.Aceptar(s.Id));            // segunda vez: ya no está Pendiente
         Assert.False(_repo.Rechazar(s.Id));          // ni se puede rechazar después
         Assert.Equal(1, _repo.ContarConsultas());
@@ -59,17 +73,45 @@ public sealed class RepositorioTests : IDisposable
     }
 
     [Fact]
-    public void Ajustes_YNodos_SePersisten()
+    public void Directorio_GuardaHuellaFijadaYAlerta()
+    {
+        _repo.GuardarNodo(new NodoConocido { NodeId = "EQ07", Equipo = 7, Ip = "10.0.0.7", HttpPort = 5007, HuellaPresentada = "AA", Algoritmos = "MILLERRABIN,FISHERYATES", Fuente = "beacon", Estado = "online" });
+        var n = _repo.ObtenerNodo("EQ07")!;
+        Assert.False(n.Confiable);                       // aún no se confirma la huella
+        n.HuellaFijada = "AA";
+        _repo.GuardarNodo(n);
+        Assert.True(_repo.ObtenerNodo("EQ07")!.Confiable);
+        n.HuellaPresentada = "BB"; n.Alerta = true;
+        _repo.GuardarNodo(n);
+        var cambiado = _repo.ObtenerNodo("EQ07")!;
+        Assert.False(cambiado.Confiable);
+        Assert.Equal("AA", cambiado.HuellaFijada);       // la fijada no se pierde
+        Assert.Equal(new[] { "MILLERRABIN", "FISHERYATES" }, cambiado.ListaAlgoritmos);
+        Assert.Equal("10.0.0.7:5007", cambiado.Direccion);
+    }
+
+    [Fact]
+    public void RequestId_SoloSeAceptaUnaVez()
+    {
+        Assert.True(_repo.RegistrarPeticion("r1"));
+        Assert.False(_repo.RegistrarPeticion("r1"));
+    }
+
+    [Fact]
+    public void Llaves_SeListanSinLaPrivada()
+    {
+        _repo.GuardarLlave(new LlaveAlgoritmo { KeyId = "EQ03-KEY-1", Algoritmo = "RSA", PublicaSpkiBase64 = "pub", PrivadaPem = "-----BEGIN ENCRYPTED PRIVATE KEY-----", Permitidos = "EQ05" });
+        var k = Assert.Single(_repo.ListarLlaves());
+        Assert.Equal("", k.PrivadaPem);
+        Assert.Equal("-----BEGIN ENCRYPTED PRIVATE KEY-----", _repo.ObtenerLlave("EQ03-KEY-1")!.PrivadaPem);
+    }
+
+    [Fact]
+    public void Ajustes_SePersisten()
     {
         _repo.GuardarAjuste("k", "v1");
         _repo.GuardarAjuste("k", "v2");
         Assert.Equal("v2", _repo.LeerAjuste("k"));
-
-        _repo.GuardarNodo(new NodoConocido { Direccion = "10.0.0.1:5000", NodoId = "NODO-07", Estado = "en línea", CertificadoRsaPem = "pem" });
-        _repo.GuardarNodo(new NodoConocido { Direccion = "10.0.0.1:5000", NodoId = "NODO-07", Estado = "sin respuesta" });
-        var n = _repo.ObtenerNodo("10.0.0.1:5000")!;
-        Assert.Equal("sin respuesta", n.Estado);
-        Assert.Equal("pem", n.CertificadoRsaPem); // no se pierde el certificado si la segunda vez no respondió
     }
 
     public void Dispose()

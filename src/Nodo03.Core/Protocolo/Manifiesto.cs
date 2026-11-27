@@ -1,154 +1,176 @@
 using System.Text.Encodings.Web;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace Nodo03.Core.Protocolo;
 
 /// <summary>
-/// Representa el archivo <c>manifest.json</c> definido en la sección 2.1 de la propuesta.
+/// <c>manifest.json</c> versión 2.0 (sección 9.5 del estándar). Los nombres JSON son exactamente
+/// los del estándar; los campos que aceptan <c>null</c> se escriben como <c>null</c> (no se omiten),
+/// porque el estándar los marca como obligatorios.
 /// </summary>
-/// <remarks>
-/// <para>
-/// Los nombres JSON se fijan con <see cref="JsonPropertyNameAttribute"/> para que sean
-/// EXACTAMENTE los del estándar (camelCase en inglés), sin importar cómo se llamen
-/// las propiedades en C#. Así un nodo en Java, Node.js o Python lee lo mismo.
-/// </para>
-/// <para>
-/// Campos que otros equipos agreguen y que este nodo no conoce NO se pierden:
-/// quedan en <see cref="CamposExtra"/> y se vuelven a escribir tal cual
-/// (<see cref="JsonExtensionDataAttribute"/>).
-/// </para>
-/// </remarks>
 public sealed class Manifiesto
 {
-    /// <summary>Versión del protocolo. Hoy siempre "1.0".</summary>
-    [JsonPropertyName("version")] public string Version { get; set; } = "1.0";
-
-    /// <summary>Identificador único del paquete (UUID). Sirve para detectar duplicados.</summary>
-    [JsonPropertyName("packetId")] public string PacketId { get; set; } = Guid.NewGuid().ToString();
-
-    /// <summary>Nodo emisor tal como se presenta, ej. "NODO-03".</summary>
+    [JsonPropertyName("version")] public string Version { get; set; } = Identificadores.VersionProtocolo;
+    [JsonPropertyName("packetType")] public string PacketType { get; set; } = TiposPaquete.Package;
+    [JsonPropertyName("packetId")] public string PacketId { get; set; } = Identificadores.NuevoUuid();
+    [JsonPropertyName("requestId")] public string? RequestId { get; set; }
     [JsonPropertyName("sourceNode")] public string SourceNode { get; set; } = "";
-
-    /// <summary>"IP:Puerto" donde el emisor escucha. Es a donde se regresa la pelota en el ping-pong.</summary>
+    [JsonPropertyName("sourceTeam")] public int SourceTeam { get; set; }
     [JsonPropertyName("sourceIp")] public string SourceIp { get; set; } = "";
-
-    /// <summary>
-    /// Marca de tiempo UTC en formato ISO-8601 sin fracciones: "2026-11-24T20:15:00Z".
-    /// Se guarda como TEXTO (no como DateTime) porque forma parte de la cadena firmada:
-    /// si se reformateara, la firma dejaría de coincidir.
-    /// </summary>
+    [JsonPropertyName("producerNode")] public string ProducerNode { get; set; } = "";
     [JsonPropertyName("timestampUtc")] public string TimestampUtc { get; set; } = "";
-
-    /// <summary>Nombre técnico legible, ej. "RSA-OAEP-SHA256+AES-256-GCM".</summary>
-    [JsonPropertyName("algorithm")] public string Algorithm { get; set; } = "";
-
-    /// <summary>Código corto oficial de la tabla 1.1, ej. "RSA" o "ECC".</summary>
+    [JsonPropertyName("algorithmId")] public int AlgorithmId { get; set; }
     [JsonPropertyName("algorithmCode")] public string AlgorithmCode { get; set; } = "";
-
-    /// <summary>"text", "image" o "file".</summary>
+    [JsonPropertyName("algorithmName")] public string AlgorithmName { get; set; } = "";
+    [JsonPropertyName("operation")] public string Operation { get; set; } = Operaciones.Forward;
+    [JsonPropertyName("operationName")] public string OperationName { get; set; } = "";
     [JsonPropertyName("payloadMode")] public string PayloadMode { get; set; } = ModosCarga.Archivo;
-
-    /// <summary>Nombre del archivo original (para texto: "mensaje.txt").</summary>
     [JsonPropertyName("originalFileName")] public string OriginalFileName { get; set; } = "";
-
-    /// <summary>Extensión original con punto, ej. ".png".</summary>
     [JsonPropertyName("originalExtension")] public string OriginalExtension { get; set; } = "";
-
-    /// <summary>Tamaño en bytes del contenido ANTES de cifrar.</summary>
     [JsonPropertyName("originalSizeBytes")] public long OriginalSizeBytes { get; set; }
-
-    /// <summary>SHA-256 en hexadecimal minúsculas (64 caracteres) de los bytes exactos de datos.enc.</summary>
+    [JsonPropertyName("contentType")] public string ContentType { get; set; } = "application/octet-stream";
     [JsonPropertyName("encryptedSha256")] public string EncryptedSha256 { get; set; } = "";
+    [JsonPropertyName("encryptedSizeBytes")] public long EncryptedSizeBytes { get; set; }
+    [JsonPropertyName("parts")] public List<ParteMultiarchivo>? Parts { get; set; }
+    [JsonPropertyName("keyRef")] public RefLlave? KeyRef { get; set; }
 
-    /// <summary>
-    /// Parámetros públicos para descifrar (IV, tag, llave efímera, etc.).
-    /// NUNCA contiene llaves privadas ni contraseñas.
-    /// Se modela como <see cref="JsonObject"/> porque cada algoritmo usa campos distintos.
-    /// </summary>
-    [JsonPropertyName("publicParameters")] public JsonObject PublicParameters { get; set; } = new();
+    /// <summary>Objeto PLANO con valores cadena (sección 8.5). Nunca secretos.</summary>
+    [JsonPropertyName("publicParameters")] public Dictionary<string, string> PublicParameters { get; set; } = new(StringComparer.Ordinal);
 
-    /// <summary>SHA-256 (hex MAYÚSCULAS) del certificado DER incluido en certificado.pem.</summary>
+    [JsonPropertyName("publicParametersSha256")] public string PublicParametersSha256 { get; set; } = "";
+    [JsonPropertyName("verification")] public Verificacion? Verification { get; set; }
+    [JsonPropertyName("resultEnvelope")] public Cripto.SobreCc? ResultEnvelope { get; set; }
     [JsonPropertyName("certificateThumbprintSha256")] public string CertificateThumbprintSha256 { get; set; } = "";
-
-    /// <summary>"RSA-PSS-SHA256" o "ECDSA-P256-SHA256" en este nodo.</summary>
-    [JsonPropertyName("signatureAlgorithm")] public string SignatureAlgorithm { get; set; } = "";
-
-    /// <summary>Firma en Base64 de <c>Cripto.FirmaManifiesto.CadenaAFirmar</c>.</summary>
+    [JsonPropertyName("signatureAlgorithm")] public string SignatureAlgorithm { get; set; } = Cripto.FirmaManifiesto.Algoritmo;
     [JsonPropertyName("manifestSignatureBase64")] public string ManifestSignatureBase64 { get; set; } = "";
 
-    /// <summary>Campos desconocidos que vengan de otros equipos (se conservan).</summary>
+    /// <summary>Campos desconocidos: se ignoran (regla de 9.5), pero se conservan al leer.</summary>
     [JsonExtensionData] public Dictionary<string, JsonElement>? CamposExtra { get; set; }
 
-    // ------------------------------------------------------------------
-    // Serialización
-    // ------------------------------------------------------------------
+    /// <summary>Campos que DEBEN existir en el JSON (aunque su valor sea null).</summary>
+    public static readonly string[] Obligatorios =
+    [
+        "version", "packetType", "packetId", "requestId", "sourceNode", "sourceTeam", "sourceIp", "producerNode",
+        "timestampUtc", "algorithmId", "algorithmCode", "algorithmName", "operation", "operationName", "payloadMode",
+        "originalFileName", "originalExtension", "originalSizeBytes", "contentType", "encryptedSha256",
+        "encryptedSizeBytes", "parts", "keyRef", "publicParameters", "publicParametersSha256",
+        "certificateThumbprintSha256", "signatureAlgorithm", "manifestSignatureBase64",
+    ];
 
-    /// <summary>
-    /// Opciones compartidas: JSON con sangría (legible al abrir el zip), sin escapar
-    /// acentos (UTF-8 real) y tolerante a mayúsculas/minúsculas al LEER, por si
-    /// otro equipo escribió "PacketId" en lugar de "packetId".
-    /// </summary>
-    public static readonly JsonSerializerOptions OpcionesJson = new()
+    public static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = true,
-        PropertyNameCaseInsensitive = true,
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        NumberHandling = JsonNumberHandling.AllowReadingFromString,
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never,
     };
 
-    /// <summary>Convierte a JSON UTF-8 sin BOM (el BOM rompe algunos parsers de otros lenguajes).</summary>
-    public byte[] ABytes() => JsonSerializer.SerializeToUtf8Bytes(this, OpcionesJson);
+    /// <summary>JSON UTF-8 sin BOM.</summary>
+    public byte[] ABytes() => JsonSerializer.SerializeToUtf8Bytes(this, Json);
 
-    /// <summary>Lee un manifest.json. Lanza <see cref="PaqueteMalformadoException"/> si no es JSON válido.</summary>
-    public static Manifiesto DesdeBytes(byte[] json)
+    /// <summary>Copia profunda (para reempaquetar sin tocar el original).</summary>
+    public Manifiesto Clonar() => JsonSerializer.Deserialize<Manifiesto>(ABytes(), Json)!;
+
+    /// <summary>
+    /// Lee y valida el FORMATO del manifiesto (validación 5 de la sección 13.1).
+    /// Lanza <see cref="ErrorProtocolo"/> E-MANIFEST con el detalle del problema.
+    /// </summary>
+    public static Manifiesto Leer(byte[] json)
     {
+        ReadOnlySpan<byte> datos = json;
+        if (datos.Length >= 3 && datos[0] == 0xEF && datos[1] == 0xBB && datos[2] == 0xBF) datos = datos[3..];
+
+        Manifiesto m;
         try
         {
-            // Quitamos un posible BOM UTF-8 que algún editor haya agregado.
-            ReadOnlySpan<byte> datos = json;
-            if (datos.Length >= 3 && datos[0] == 0xEF && datos[1] == 0xBB && datos[2] == 0xBF) datos = datos[3..];
-            return JsonSerializer.Deserialize<Manifiesto>(datos, OpcionesJson)
-                   ?? throw new PaqueteMalformadoException("manifest.json está vacío.");
+            using var doc = JsonDocument.Parse(datos.ToArray());
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new ErrorProtocolo("E-MANIFEST", "manifest.json no es un objeto JSON.");
+            var faltan = Obligatorios.Where(c => !doc.RootElement.TryGetProperty(c, out _)).ToList();
+            if (faltan.Count > 0) throw new ErrorProtocolo("E-MANIFEST", "Faltan campos obligatorios: " + string.Join(", ", faltan));
+            if (doc.RootElement.GetProperty("publicParameters").ValueKind != JsonValueKind.Object)
+                throw new ErrorProtocolo("E-MANIFEST", "publicParameters debe ser un objeto plano.");
+            m = JsonSerializer.Deserialize<Manifiesto>(datos, Json)!;
         }
         catch (JsonException ex)
         {
-            throw new PaqueteMalformadoException($"manifest.json no es JSON válido: {ex.Message}");
+            throw new ErrorProtocolo("E-MANIFEST", "manifest.json inválido (¿publicParameters con valores que no son cadena?): " + ex.Message);
         }
+        ValidarFormatos(m);
+        return m;
     }
 
-    // ------------------------------------------------------------------
-    // Ayudantes para leer publicParameters sin pelear con JsonNode
-    // ------------------------------------------------------------------
+    private static void ValidarFormatos(Manifiesto m)
+    {
+        var e = new List<string>();
+        if (m.PacketType is not (TiposPaquete.Package or TiposPaquete.Result)) e.Add("packetType");
+        if (!Identificadores.Uuid4().IsMatch(m.PacketId ?? "")) e.Add("packetId");
+        if (m.RequestId is not null && !Identificadores.Uuid4().IsMatch(m.RequestId)) e.Add("requestId");
+        if (!Identificadores.NodeId().IsMatch(m.SourceNode ?? "")) e.Add("sourceNode");
+        if (Identificadores.EquipoDeNodo(m.SourceNode) != m.SourceTeam) e.Add("sourceTeam");
+        if (!Identificadores.NodeId().IsMatch(m.ProducerNode ?? "")) e.Add("producerNode");
+        if (!Identificadores.Timestamp().IsMatch(m.TimestampUtc ?? "")) e.Add("timestampUtc");
+        if (!Operaciones.EsValida(m.Operation)) e.Add("operation");
+        if (!ModosCarga.EsValido(m.PayloadMode)) e.Add("payloadMode");
+        if (!Identificadores.HashContenido().IsMatch(m.EncryptedSha256 ?? "")) e.Add("encryptedSha256");
+        if (!Identificadores.HashContenido().IsMatch(m.PublicParametersSha256 ?? "")) e.Add("publicParametersSha256");
+        if (!Identificadores.Huella().IsMatch(m.CertificateThumbprintSha256 ?? "")) e.Add("certificateThumbprintSha256");
+        if (m.SignatureAlgorithm != Cripto.FirmaManifiesto.Algoritmo) e.Add("signatureAlgorithm");
+        if (string.IsNullOrEmpty(m.ManifestSignatureBase64)) e.Add("manifestSignatureBase64");
+        if (m.PayloadMode == ModosCarga.Multiparte && (m.Parts is null || m.Parts.Count == 0)) e.Add("parts");
+        if (m.KeyRef is not null && !Identificadores.KeyId().IsMatch(m.KeyRef.KeyId ?? "")) e.Add("keyRef.keyId");
+        if (e.Count > 0) throw new ErrorProtocolo("E-MANIFEST", "Formato inválido en: " + string.Join(", ", e));
+    }
 
-    /// <summary>Lee un parámetro público como texto (o null si no existe).</summary>
-    public string? Parametro(string nombre) =>
-        PublicParameters.TryGetPropertyValue(nombre, out var n) && n is not null ? n.ToString() : null;
-
-    /// <summary>Lee un parámetro público entero (o el valor por defecto).</summary>
-    public int ParametroEntero(string nombre, int porDefecto = 0) =>
-        int.TryParse(Parametro(nombre), out var v) ? v : porDefecto;
+    /// <summary>Parámetro público o null.</summary>
+    public string? Parametro(string nombre) => PublicParameters.TryGetValue(nombre, out var v) ? v : null;
 }
 
-/// <summary>Valores permitidos para <see cref="Manifiesto.PayloadMode"/>.</summary>
+/// <summary>Elemento de <c>parts</c> en paquetes multiparte (9.4).</summary>
+public sealed record ParteMultiarchivo(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("sizeBytes")] long SizeBytes,
+    [property: JsonPropertyName("sha256")] string Sha256);
+
+/// <summary><c>keyRef</c>: llave guardada por el dueño del algoritmo (sección 12).</summary>
+public sealed record RefLlave(
+    [property: JsonPropertyName("keyId")] string KeyId,
+    [property: JsonPropertyName("ownerNode")] string OwnerNode);
+
+/// <summary><c>verification</c> en paquetes result de hash, MAC y firma.</summary>
+public sealed record Verificacion(
+    [property: JsonPropertyName("valid")] bool Valid,
+    [property: JsonPropertyName("detail")] string Detail);
+
+/// <summary>Valores de <c>payloadMode</c>.</summary>
 public static class ModosCarga
 {
     public const string Texto = "text";
     public const string Imagen = "image";
     public const string Archivo = "file";
+    public const string Multiparte = "multipart";
 
-    /// <summary>Normaliza lo que venga del usuario u otro nodo a uno de los tres valores.</summary>
+    public static bool EsValido(string? m) => m is Texto or Imagen or Archivo or Multiparte;
+
     public static string Normalizar(string? modo) => modo?.Trim().ToLowerInvariant() switch
     {
         "text" or "texto" => Texto,
         "image" or "imagen" => Imagen,
+        "multipart" => Multiparte,
         _ => Archivo,
     };
-}
 
-/// <summary>
-/// Se lanza cuando el paquete no respeta la ESTRUCTURA del estándar
-/// (no es zip, faltan archivos, JSON roto...). El receptor responde 400 Bad Request.
-/// </summary>
-public sealed class PaqueteMalformadoException(string mensaje) : Exception(mensaje);
+    /// <summary>Tipo MIME a partir de la extensión.</summary>
+    public static string Mime(string nombre, string modo) => Path.GetExtension(nombre).ToLowerInvariant() switch
+    {
+        ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".gif" => "image/gif",
+        ".bmp" => "image/bmp",
+        ".webp" => "image/webp",
+        ".pdf" => "application/pdf",
+        ".txt" => "text/plain",
+        ".json" => "application/json",
+        ".zip" => "application/zip",
+        _ => modo == Texto ? "text/plain" : "application/octet-stream",
+    };
+}

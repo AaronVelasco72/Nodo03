@@ -7,15 +7,13 @@ namespace Nodo03.Web.Servicios;
 /// Ping-pong AUTOMÁTICO: trabajador en segundo plano que regresa las pelotas solo.
 /// </summary>
 /// <remarks>
-/// <para>Cuando "Rebotar automáticamente" está encendido en Ajustes, el receptor mete el id
-/// de la solicitud en una cola (<see cref="Channel{T}"/>). Este servicio la saca y hace,
-/// sin intervención humana: Aceptar → Descifrar → Re-cifrar → Enviar de regreso.</para>
-/// <para>¿Por qué una cola y no hacerlo dentro de la petición HTTP? Porque el emisor está
-/// esperando la respuesta 202; si en ese momento le mandáramos el rebote, los dos nodos
-/// quedarían esperándose. Con la cola, el receptor responde 202 de inmediato y el rebote
-/// sale un momento después.</para>
-/// <para>El límite <c>MaxRebotes</c> corta el rally para que dos nodos automáticos no jueguen
-/// para siempre.</para>
+/// <para>Con "Rebotar automáticamente" encendido en Ajustes, cuando llega a la bandeja una
+/// pelota RSA/ECC el receptor mete su id en una cola (<see cref="Channel{T}"/>). Este servicio
+/// la saca y hace, sin intervención: Aceptar → inverse → forward → enviar de regreso.</para>
+/// <para>¿Por qué una cola? Porque el emisor está esperando nuestro 202; si en ese momento le
+/// mandáramos el rebote, los dos nodos quedarían esperándose. Con la cola respondemos 202 de
+/// inmediato y el rebote sale un momento después.</para>
+/// <para><c>MaxRebotes</c> corta el rally para que dos nodos automáticos no jueguen para siempre.</para>
 /// </remarks>
 public sealed class MotorPingPong(IServiceProvider servicios, ILogger<MotorPingPong> log) : BackgroundService
 {
@@ -40,9 +38,9 @@ public sealed class MotorPingPong(IServiceProvider servicios, ILogger<MotorPingP
                 // Aceptar de forma atómica: si el usuario ya la aceptó/rechazó a mano, se respeta.
                 var consulta = repo.Aceptar(id);
                 if (consulta is null) continue;
-                bus.Publicar("decision", new { id, estado = EstadosSolicitud.Aceptada, automatico = true });
+                bus.Publicar("decision", new { id, estado = EstadosSolicitud.Aceptada, automatico = true, pendientes = repo.ContarPendientes() });
 
-                var r = await envio.Rebotar(consulta.Id, detener);
+                var r = await envio.Rebotar(consulta.Id, null, detener);
                 if (!r.Ok) log.LogWarning("Rebote automático falló: {Mensaje}", r.Mensaje);
             }
             catch (OperationCanceledException) when (detener.IsCancellationRequested)
@@ -52,7 +50,7 @@ public sealed class MotorPingPong(IServiceProvider servicios, ILogger<MotorPingP
             catch (Exception ex)
             {
                 // Un rebote fallido nunca debe tumbar al trabajador.
-                log.LogError(ex, "Error en rebote automático de {Id}", id);
+                log.LogWarning("Rebote automático de {Id} falló: {Error}", id, ex.Message);
                 servicios.GetRequiredService<RepositorioNodo>().Registrar("error", "Rebote automático falló: " + ex.Message);
             }
         }

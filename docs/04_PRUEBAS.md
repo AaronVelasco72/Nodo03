@@ -1,11 +1,12 @@
-# 4. Pruebas
+# 4. Pruebas (estándar v2.0)
 
 ## 4.1 Cómo ejecutarlas
 
 ```bash
-dotnet test                                   # todas
-dotnet test --filter "FullyQualifiedName~Concurrencia"   # solo concurrencia
-dotnet test --logger "console;verbosity=detailed"        # con el nombre de cada prueba
+dotnet test                                                  # todas (102)
+dotnet test --filter "FullyQualifiedName~Concurrencia"       # solo concurrencia
+dotnet test --filter "FullyQualifiedName~Integracion"        # nodos reales por HTTP y UDP
+dotnet test --logger "console;verbosity=detailed"            # con el nombre de cada prueba
 ```
 
 En Visual Studio aparecen en el **Explorador de pruebas**.
@@ -14,196 +15,172 @@ En Visual Studio aparecen en el **Explorador de pruebas**.
 
 | Nivel | Carpeta | Qué valida | Cómo |
 | --- | --- | --- | --- |
-| Unitarias | `Unitarias/` | Cada pieza aislada: cifradores, firma, nombre del zip, lector de zip, validador, identidad, base de datos, utilidades | Identidades en memoria, sin red |
-| Integración | `Integracion/` | El protocolo HTTP completo y el flujo entre nodos | Se levantan **nodos reales** (Kestrel) en puertos aleatorios de `127.0.0.1`, cada uno con su carpeta temporal, y se comunican por HTTP igual que en la LAN |
-| Concurrencia | `Concurrencia/` | Que no haya condiciones de carrera | Decenas de peticiones simultáneas con `Task.WhenAll` / `Parallel.ForEachAsync` y comprobación de que el resultado es el mismo que en serie |
-| Interoperabilidad | `herramientas/` | Que otro lenguaje entienda los paquetes | Scripts en Python verifican firmas y descifran RSA directo, RSA híbrido y ECIES generados por el nodo .NET |
+| Unitarias | `Unitarias/` | Identificadores, tabla 4.1, cadena 8.4, hash canónico 8.5 (con el ejemplo del estándar), nombres 9.2, cada código de error de 13.1, certificado de la sección 7, RSA-PSS, `CC-ENV-1`, RSA/ECC, `keyId`, `allowedNodes`, resultado y reenvío 9.6, base de datos | Identidades en memoria y una base SQLite temporal |
+| Integración | `Integracion/` | API del estándar por HTTP, errores `problem+json`, trabajos 202, delegación EQ13 → EQ03, bandeja, ping-pong automático y manual, TOFU y alerta de huella, escaneo, anuncio UDP real | Se levantan **nodos reales** (Kestrel) en puertos aleatorios de `127.0.0.1`; la prueba hace de "otro equipo" (EQ05) firmando sus peticiones |
+| Concurrencia | `Concurrencia/` | Que no haya condiciones de carrera | Decenas de peticiones simultáneas (`Task.WhenAll` / `Parallel.ForEachAsync`) y comprobación de que el resultado es el mismo que en serie |
+| Interoperabilidad | `herramientas/` | Que otro lenguaje entienda al nodo | `cliente_v2.py` (Python) genera su identidad, firma la petición, valida el paquete y abre el `CC-ENV-1`; `verificar_paquete.py` aplica 13.1 |
 
 ## 4.3 Cómo se validó la concurrencia
 
 | Riesgo | Mecanismo en el código | Prueba |
 | --- | --- | --- |
-| Muchos paquetes al mismo tiempo agotan memoria | `SemaphoreSlim` limita validaciones simultáneas a 2 × núcleos | `Cincuenta_PaquetesDistintos_AlMismoTiempo_NingunoSePierde` |
-| Un emisor reintenta y llegan copias simultáneas | Índice `UNIQUE(packet_id)` + `INSERT OR IGNORE`; la copia perdedora borra su zip | `VeinticincoCopias_DelMismoPaquete_SoloSeRegistraUna` (1 registro, 1 archivo) |
-| Doble clic en Aceptar, o usuario y ping-pong automático a la vez | `UPDATE … WHERE estado='Pendiente'` + inserción en Consultas dentro de la misma transacción | `VeinteClicsEnAceptar_AlMismoTiempo_SoloUnoGana` (1×200, 19×409, 1 consulta) |
-| Aceptar y rechazar al mismo tiempo | El mismo `WHERE` atómico | `AceptarYRechazar_AlMismoTiempo_QuedaUnSoloEstadoFinal` |
-| `RSA`/`ECDsa` compartidos entre hilos | Cada operación crea su instancia desde los parámetros de la llave | `DoscientasOperacionesCripto_ConLaMismaIdentidad_EnParalelo` |
-| `SQLITE_BUSY` por escrituras simultáneas | Modo WAL, `busy_timeout` y candado de escritura del proceso | `BaseDeDatos_CienEscriturasParalelas_SinErroresDeBloqueo` |
-| Dos nodos enviándose al mismo tiempo en ambas direcciones | `HttpClient` único, servicios sin estado mutable compartido | `DosNodos_EnviandoseALaVez_EnAmbasDirecciones` (15 + 15) |
-| Ping-pong automático que nunca termina | Cola `Channel` + límite `MaxRebotes` | `PingPongAutomatico_SeDetieneEnElMaximoDeRebotes` |
-| Navegador lento bloquea las alertas | Canal acotado por suscriptor con descarte del más viejo | (diseño) |
+| Muchos paquetes a la vez agotan memoria | `SemaphoreSlim` por nodo (2 × núcleos) | `Cincuenta_PaquetesDistintos_AlMismoTiempo_NingunoSePierde` |
+| Copias simultáneas del mismo paquete | Índice `UNIQUE(packet_id)` + `INSERT OR IGNORE`; la copia perdedora borra su zip | `VeinticincoCopias_…_ElRestoEs409` (1×202, 24×409, 1 archivo) |
+| Doble clic en Aceptar o usuario + ping-pong a la vez | `UPDATE … WHERE estado='Pendiente'` + inserción en Consultas en la misma transacción | `VeinteClicsEnAceptar_…` (1×200, 19×409) y `AceptarYRechazar_…` |
+| Más de 10 `/api/crypto/*` a la vez (13.3) | `SemaphoreSlim(10)` por nodo con `Wait(0)` → `503 E-BUSY` | `TreintaPeticionesCripto_Simultaneas_LimiteDe10_…` (y cada forward genera su propio `keyId` sin choques) |
+| Una llave `keyId` usada desde muchos hilos | Cada operación importa su propia instancia de RSA/ECDH | `DoscientasOperacionesCripto_ConLaMismaLlave_EnParalelo` |
+| `SQLITE_BUSY` por escrituras simultáneas | WAL, `busy_timeout` y candado de escritura | `BaseDeDatos_CienEscriturasParalelas_…` |
+| Dos nodos delegando y enviándose a la vez | `HttpClient` único y servicios sin estado mutable compartido | `DosNodos_DelegandoYEnviando_EnAmbasDirecciones` (8 + 8) |
+| Ping-pong que nunca termina | Cola `Channel` + `MaxRebotes` | `PingPongAutomatico_RebotaHastaElLimite` (saltos 0‒4 exactos) |
 
 ## 4.4 Resultado
 
-Las 110 pruebas pasan. La suite completa se ejecutó tres veces seguidas sin fallas (las de concurrencia son las que podrían ser intermitentes si hubiera una carrera).
-
 ```text
-Total: 110  Pasan: 110  Fallan: 0
+Total: 102  Pasan: 102  Fallan: 0
 ```
 
-**CifradorEccTests** (8)
+La suite se corrió varias veces seguidas sin fallas. En el desarrollo, la de concurrencia encontró un problema real: el
+límite de 10 peticiones era `static` y se compartía entre nodos del mismo proceso; se corrigió para que sea por nodo.
 
-- ✔ `CadaEnvio_UsaUnaLlaveEfimeraNueva` · 2 ms
-- ✔ `CertificadoRsa_NoSirveParaEcc` · 0 ms
-- ✔ `CifraYDescifra_CualquierTamano(1)` · 296 ms
-- ✔ `CifraYDescifra_CualquierTamano(190)` · 3 ms
-- ✔ `CifraYDescifra_CualquierTamano(300000)` · 82 ms
-- ✔ `DatosOTagAlterados_SonDetectados` · 6 ms
-- ✔ `LlaveEfimera_EsSubjectPublicKeyInfoP256` · 1 ms
-- ✔ `OtroNodo_NoPuedeDescifrar` · 249 ms
+### Unitarias
 
-**CifradorRsaTests** (10)
+**CifradoresTests** (3)
 
-- ✔ `ArchivoGrande_UsaHibridoRsaAes_YSeRecupera` · 226 ms
-- ✔ `CertificadoEc_NoSirveParaRsa` · 0 ms
-- ✔ `DatosAlterados_SonDetectadosPorElTagGcm` · 3 ms
-- ✔ `ElLimiteDe190BytesDecideElEsquema(190, RSA-OAEP-SHA256)` · 0 ms
-- ✔ `ElLimiteDe190BytesDecideElEsquema(191, RSA-OAEP-SHA256+AES-256-G…)` · 0 ms
-- ✔ `FraseCorta_UsaRsaDirecto_YSeRecupera` · 298 ms
-- ✔ `MismoMensaje_DosCifrados_SonDistintos` · 0 ms
-- ✔ `OtroNodo_NoPuedeDescifrar(20)` · 104 ms
-- ✔ `OtroNodo_NoPuedeDescifrar(5000)` · 6 ms
-- ✔ `ParametrosPublicos_NoContienenSecretos` · 11 ms
+- ✔ `Ecc_ParametrosDeLaTabla42_YSeRecupera`
+- ✔ `MismoMensaje_DosCifrados_SonDistintos`
+- ✔ `Rsa_ParametrosDeLaTabla42_YSeRecupera`
 
-**ConcurrenciaTests** (7)
+**IdentidadTests** (3)
 
-- ✔ `AceptarYRechazar_AlMismoTiempo_QuedaUnSoloEstadoFinal` · 1401 ms
-- ✔ `BaseDeDatos_CienEscriturasParalelas_SinErroresDeBloqueo` · 1069 ms
-- ✔ `Cincuenta_PaquetesDistintos_AlMismoTiempo_NingunoSePierde` · 1541 ms
-- ✔ `DoscientasOperacionesCripto_ConLaMismaIdentidad_EnParalelo` · 2524 ms
-- ✔ `DosNodos_EnviandoseALaVez_EnAmbasDirecciones` · 3758 ms
-- ✔ `VeinteClicsEnAceptar_AlMismoTiempo_SoloUnoGana` · 1880 ms
-- ✔ `VeinticincoCopias_DelMismoPaquete_SoloSeRegistraUna` · 1288 ms
+- ✔ `Certificado_CumpleLaSeccion7`
+- ✔ `FirmaRsaPss_SeVerifica_YDetectaCambios`
+- ✔ `Identidad_SeGuardaCifrada_YSeRecarga`
 
-**EmpaquetadorZipTests** (11)
+**ProtocoloTests** (26)
 
-- ✔ `ArchivoDeMas_EsMalformado` · 6 ms
-- ✔ `BombaZip_EsCortadaPorElLimiteDescomprimido` · 10 ms
-- ✔ `CamposDesconocidosDeOtrosEquipos_SeConservan` · 4 ms
-- ✔ `ElZipTieneExactamenteLosTresArchivos` · 301 ms
-- ✔ `FaltaUnArchivo_EsMalformado(certificado.pem)` · 9 ms
-- ✔ `FaltaUnArchivo_EsMalformado(datos.enc)` · 8 ms
-- ✔ `FaltaUnArchivo_EsMalformado(manifest.json)` · 2 ms
-- ✔ `ManifiestoQueNoEsJson_EsMalformado` · 4 ms
-- ✔ `ManifiestoSinFirma_EsMalformado` · 4 ms
-- ✔ `NoEsZip_EsMalformado` · 3 ms
-- ✔ `Subcarpetas_SonRechazadas_ProtegeContraZipSlip` · 3 ms
+- ✔ `CadenaDeFirma_TieneLosOnceCamposEnOrden`
+- ✔ `CampoFirmadoAlterado_ESignature`
+- ✔ `Carpeta_EZipStructure`
+- ✔ `CertificadoDeOtroNodo_ECert`
+- ✔ `CuatroArchivos_EZipStructure`
+- ✔ `DatosAlterados_EHash`
+- ✔ `Deflate_YStore_SeAceptanAmbos`
+- ✔ `Diccionario_Tiene21Algoritmos_YElEquipo3TieneRsaYEcc`
+- ✔ `FaltaCampo_EManifest`
+- ✔ `FechaVieja_ETimestamp`
+- ✔ `HuellaNoCoincide_ECertThumbprint`
+- ✔ `IdYCodigoNoCoinciden_EAlgorithm`
+- ✔ `Manifiesto_CamposDesconocidos_SeIgnoran`
+- ✔ `Manifiesto_EscribeTodosLosCamposObligatorios_AunqueSeanNull`
+- ✔ `NoEsZip_EZipInvalid`
+- ✔ `NodeId_EsEQMasDosDigitos`
+- ✔ `Nombres_PackageYResult`
+- ✔ `PaqueteValido_PasaLasCatorce`
+- ✔ `ParametroNoCadena_EManifest`
+- ✔ `ParametrosAlterados_EParamsHash`
+- ✔ `ParametrosCanonicos_EjemploDelEstandar`
+- ✔ `ParametrosCanonicos_OrdenaPorBytesUtf8_NoPorCultura`
+- ✔ `ParametrosCanonicos_Vacio_EsElHashDeLaCadenaVacia`
+- ✔ `Ventana_EsDeMasMenosDiezMinutos`
+- ✔ `Version1_EVersion`
+- ✔ `ZipBomba_EZipBomb`
 
-**FirmaManifiestoTests** (9)
+**ProveedorTests** (9)
 
-- ✔ `CambiarLaFecha_InvalidaLaFirma` · 3 ms
-- ✔ `CertificadoDeOtroNodo_NoVerifica` · 2 ms
-- ✔ `FirmaEcdsa_SeEmiteEnDer` · 1 ms
-- ✔ `FirmaEcdsaFormatoP1363_DeOtroLenguaje_TambienSeAcepta` · 1 ms
-- ✔ `FirmaPropia_SeVerificaConElCertificado(ECC, ECDSA-P256-SHA256)` · 1 ms
-- ✔ `FirmaPropia_SeVerificaConElCertificado(RSA, RSA-PSS-SHA256)` · 438 ms
-- ✔ `FirmaSobreManifiestoCanonico_TambienSeAcepta` · 14 ms
-- ✔ `FirmaVaciaOBasura_EsInvalida()` · 2 ms
-- ✔ `FirmaVaciaOBasura_EsInvalida(esto-no-es-base64!!)` · 2 ms
+- ✔ `AlgoritmoAjeno_EAlgorithmNotProvided`
+- ✔ `AllowedNodes_RestringeQuienUsaLaLlave`
+- ✔ `ForwardConKeyId_ReutilizaLaLlave`
+- ✔ `ForwardSinKeyId_GeneraLlave_EInverseRecupera(ECC)`
+- ✔ `ForwardSinKeyId_GeneraLlave_EInverseRecupera(RSA)`
+- ✔ `KeyIdDesconocido_EKeyNotFound`
+- ✔ `OpcionDesconocida_EParams`
+- ✔ `Reempaquetar_CumpleLaSeccion96`
+- ✔ `Resultado_VaCifradoParaElSolicitante`
 
-**FlujoEntreNodosTests** (12)
+**RepositorioTests** (9)
 
-- ✔ `DestinoApagado_DevuelveMensajeClaroSinTronar` · 1001 ms
-- ✔ `EmisorNoPuedeDescifrarLoQueEnvio_SoloElDestino` · 1300 ms
-- ✔ `Imagen_ECC_LlegaIdenticaByteAByte` · 3022 ms
-- ✔ `PingPongAutomatico_SeDetieneEnElMaximoDeRebotes(ECC)` · 1402 ms
-- ✔ `PingPongAutomatico_SeDetieneEnElMaximoDeRebotes(RSA)` · 1682 ms
-- ✔ `PingPongManual_BRebotaYADescifraElMismoMensaje` · 1702 ms
-- ✔ `Rechazar_NoGuardaEnConsultas` · 2985 ms
-- ✔ `ReenviarATercero_ConservaLaFirmaDelEmisorOriginal` · 1541 ms
-- ✔ `SoloGenerar_CreaZipDescargableConNombreOficial` · 1348 ms
-- ✔ `Texto_DeANodoB_SeAceptaYSeDescifraIgual(ECC, CURP VERA040101HDFLMR09 ·…)` · 3027 ms
-- ✔ `Texto_DeANodoB_SeAceptaYSeDescifraIgual(RSA, Frase corta)` · 2206 ms
-- ✔ `Texto_DeANodoB_SeAceptaYSeDescifraIgual(RSA, Frase larga que supera lo…)` · 3532 ms
+- ✔ `Aceptar_MueveAConsultas_UnaSolaVez`
+- ✔ `Ajustes_SePersisten`
+- ✔ `Directorio_GuardaHuellaFijadaYAlerta`
+- ✔ `Llaves_SeListanSinLaPrivada`
+- ✔ `PacketIdDuplicado_NoSeInsertaDosVeces`
+- ✔ `PaquetesInvalidos_SeGuardanComoEvidencia_SinBloquearAlValido`
+- ✔ `Rechazar_NoEntraAConsultas`
+- ✔ `RequestId_SoloSeAceptaUnaVez`
+- ✔ `TextoConAcentosYComillas_SeGuardaIntacto_SinInyeccionSql`
 
-**IdentidadNodoTests** (3)
+**SobreTests** (2)
 
-- ✔ `Certificados_DeclaranElUsoCorrectoDeLaLlave` · 1 ms
-- ✔ `ContrasenaIncorrecta_NoAbreLasLlaves` · 2927 ms
-- ✔ `SeGuardaYSeRecarga_ConLaMismaHuella` · 1685 ms
+- ✔ `SobreDeResultado_NoLlevaCiphertext`
+- ✔ `Sobre_SoloLoAbreElDestinatario_ConLaMismaAad`
 
-**NombrePaqueteTests** (9)
 
-- ✔ `ReproduceElEjemploDeLaPropuesta` · 14 ms
-- ✔ `TryParse_ExtraeLasPartes` · 0 ms
-- ✔ `ValidaElFormato(CELULA03_RSA_20261124_101…, True)` · 0 ms
-- ✔ `ValidaElFormato(NODO-01_RSA_20261124_1015…, False)` · 0 ms
-- ✔ `ValidaElFormato(NODO01_AESGCM_20261116_21…, True)` · 22 ms
-- ✔ `ValidaElFormato(NODO01_RSA_2026112_101500…, False)` · 0 ms
-- ✔ `ValidaElFormato(NODO01_rsa_20261124_10150…, False)` · 0 ms
-- ✔ `ValidaElFormato(NODO01_RSA_20261124_10150…, False)` · 0 ms
-- ✔ `ValidaElFormato(NODO01_RSA_20261124_10150…, False)` · 0 ms
+### Integracion
 
-**ProtocoloHttpTests** (13)
+**DescubrimientoUdpTests** (4)
 
-- ✔ `Certificado_SePublicaEnPem(ECC)` · 2144 ms
-- ✔ `Certificado_SePublicaEnPem(RSA)` · 903 ms
-- ✔ `FaltaCertificado_400` · 1600 ms
-- ✔ `FirmaFalsificada_422` · 1411 ms
-- ✔ `MasGrandeQueElLimite_413` · 590 ms
-- ✔ `MismoPaqueteDosVeces_EsIdempotente` · 702 ms
-- ✔ `NodoQueNoAceptaPaquetes_503` · 756 ms
-- ✔ `NoEsZip_400` · 1544 ms
-- ✔ `PaqueteValido_202_YQuedaPendiente` · 1533 ms
-- ✔ `ShaAlterado_422_YQuedaRechazadaComoInvalida` · 1941 ms
-- ✔ `SinMultipart_400` · 1872 ms
-- ✔ `Status_RespondeElFormatoDelEstandar` · 1280 ms
-- ✔ `Verificador_ReportaSinRegistrar` · 849 ms
+- ✔ `AnuncioConHuellaFalsa_NoSeDaDeAlta`
+- ✔ `AnuncioPropio_CabeEnUnKilobyte`
+- ✔ `AnuncioUdp_DaDeAltaAlNodo_TrasVerificarloPorHttp`
+- ✔ `Interpretar_IgnoraPropiosYMalFormados`
 
-**RepositorioTests** (5)
+**FlujoEntreNodosTests** (9)
 
-- ✔ `Aceptar_MueveAConsultas_UnaSolaVez` · 33 ms
-- ✔ `Ajustes_YNodos_SePersisten` · 22 ms
-- ✔ `PacketIdDuplicado_NoSeInsertaDosVeces` · 58 ms
-- ✔ `Rechazar_NoEntraAConsultas` · 22 ms
-- ✔ `TextoConAcentosYComillas_SeGuardaIntacto_SinInyeccionSql` · 21 ms
+- ✔ `AlgoritmoDeOtroEquipo_SinDueno_NoDisponible`
+- ✔ `Escaneo_EncuentraAlOtroNodo`
+- ✔ `ForwardDelegado_Bandeja_Aceptar_InverseLocal(ECC)`
+- ✔ `ForwardDelegado_Bandeja_Aceptar_InverseLocal(RSA)`
+- ✔ `HuellaCambia_SeAlerta_YNoSeUsaHastaReconfirmar`
+- ✔ `Imagen_ViajaIntacta`
+- ✔ `PingPongAutomatico_RebotaHastaElLimite`
+- ✔ `ReboteManual_RegresaLaPelota`
+- ✔ `SinConfirmarHuella_ElAlgoritmoNoEstaDisponible`
 
-**ServicioPaquetesTests** (5)
+**ProtocoloHttpTests** (28)
 
-- ✔ `AlgoritmoDeOtroEquipo_NoSeIntentaDescifrar` · 9 ms
-- ✔ `CertificadoDeTipoEquivocado_SeRechazaAntesDeCifrar` · 0 ms
-- ✔ `ElDestinatarioCorrecto_RecuperaElContenido` · 14 ms
-- ✔ `Manifiesto_CumpleElEsquemaDeLaSeccion21` · 5 ms
-- ✔ `OtroNodo_RecibeErrorClaroDeDestinatario` · 3 ms
+- ✔ `Algorithms_PublicaElPerfilDeRsaYEcc`
+- ✔ `AlgoritmoDeOtroEquipo_404_EAlgorithmNotProvided`
+- ✔ `AllowedNodes_OtroNodoNoPuedeDescifrar_403`
+- ✔ `Bandeja_CuatroArchivos_400_EZipStructure`
+- ✔ `Bandeja_FechaVieja_422_ETimestamp`
+- ✔ `Bandeja_FijadoConOtraHuella_403_ECertUntrusted`
+- ✔ `Bandeja_FirmaAlterada_422_ESignature`
+- ✔ `Bandeja_HashAlterado_422_EHash_QuedaComoEvidencia`
+- ✔ `Bandeja_MuyGrande_413_ESize`
+- ✔ `Bandeja_NoAceptando_503_EBusy`
+- ✔ `Bandeja_PaqueteValido_202_YRemitenteNoConfirmado`
+- ✔ `Bandeja_RemitenteFijado_FirmaOk`
+- ✔ `Bandeja_Repetido_409_EDuplicate_ConProblemJson`
+- ✔ `Bandeja_SinMultipart_415`
+- ✔ `CertificadoNoEsDelSolicitante_422_ECert`
+- ✔ `EncabezadosXcc_EnLasRespuestas`
+- ✔ `FaltaPayload_400_ERequest`
+- ✔ `FirmaDeLaPeticionAlterada_401`
+- ✔ `ForwardEInverseRemotos_RegresanElOriginalCifradoParaElSolicitante(ECC)`
+- ✔ `ForwardEInverseRemotos_RegresanElOriginalCifradoParaElSolicitante(RSA)`
+- ✔ `Inverse_ConPaqueteSinReenviar_TambienFunciona`
+- ✔ `KeyIdDesconocido_404`
+- ✔ `Keys_DevuelveSoloLaPublica`
+- ✔ `PeticionVieja_422_ETimestamp`
+- ✔ `RequestIdRepetido_409`
+- ✔ `SobreParaOtroNodo_401_EEnvRecipient`
+- ✔ `Status_DiceEQ03_Puerto_AlgoritmosYHuella`
+- ✔ `TargetNodeEquivocado_400_ERequest`
 
-**UtilidadesWebTests** (11)
+**TrabajosAsincronosTests** (1)
 
-- ✔ `HuellasIguales_EsTolerantesAFormato` · 0 ms
-- ✔ `NombreSeguro_NoPermiteRutas(.., paquete.zip)` · 0 ms
-- ✔ `NombreSeguro_NoPermiteRutas(../../windows/system32/ev…, evil.dll)` · 4 ms
-- ✔ `NombreSeguro_NoPermiteRutas(..\..\x.zip, x.zip)` · 0 ms
-- ✔ `NombreSeguro_NoPermiteRutas(a:b*c?.zip, a_b_c_.zip)` · 0 ms
-- ✔ `Opciones_LimiteEnBytes` · 0 ms
-- ✔ `SoloLoopback_EsConsideradoLocal` · 1 ms
-- ✔ `UrlBase_NormalizaLoQueEscribeElUsuario(  http://10.0.0.5:8080/  , http://10.0.0.5:8080/)` · 0 ms
-- ✔ `UrlBase_NormalizaLoQueEscribeElUsuario(192.168.1.14, http://192.168.1.14:5000/)` · 0 ms
-- ✔ `UrlBase_NormalizaLoQueEscribeElUsuario(192.168.1.14:5000, http://192.168.1.14:5000/)` · 1 ms
-- ✔ `UrlBase_NormalizaLoQueEscribeElUsuario(localhost:5001, http://localhost:5001/)` · 2 ms
+- ✔ `TopeSincrono_Responde202_YElResultadoSoloLoBajaElSolicitante`
 
-**ValidadorPaqueteTests** (7)
 
-- ✔ `CertificadoQueNoEsPem_EsInvalido` · 7 ms
-- ✔ `CertificadoSustituido_FallaHuellaYFirma` · 10 ms
-- ✔ `DatosAlterados_FallaIntegridad` · 5 ms
-- ✔ `IntrusoRefirmaConSuLlave_PeroLaHuellaYaNoEsLaDeA` · 7 ms
-- ✔ `NombreFueraDeFormato_SoloGeneraAviso` · 8 ms
-- ✔ `PaqueteLegitimo_EsX509Ok(ECC)` · 4 ms
-- ✔ `PaqueteLegitimo_EsX509Ok(RSA)` · 299 ms
+### Concurrencia
 
-## 4.5 Interoperabilidad (Python)
+**ConcurrenciaTests** (8)
 
-```text
-$ python herramientas/verificar_paquete.py NODO05_ECC_20261125_023548_6562734C.zip
-  [OK] estructura: 3 archivos en la raíz
-  [OK] SHA-256 datos.enc = 6562734c4c3a706c…
-  [OK] huella del certificado = 4F102210C99169AF…  (CN=NODO-05 ECC,OU=Equipo 3,…)
-  [OK] firma válida: ECDSA-SHA256 (DER)
-  => X.509 OK  · algoritmo ECC · modo text
-
-$ python herramientas/descifrar_paquete.py <paquete RSA directo> rsa.key.pem ****
-CURP VERA040101HDFLMR09 — consulta tipo RENAPO para la célula 3
-$ python herramientas/descifrar_paquete.py <paquete ECC imagen> ecc.key.pem ****
-Guardado en descifrado_credencial.png (3738 bytes)
-$ python herramientas/descifrar_paquete.py <paquete RSA híbrido> rsa.key.pem ****
-Guardado en descifrado_verificar_paquete.py (5565 bytes)
-```
+- ✔ `AceptarYRechazar_AlMismoTiempo_QuedaUnSoloEstadoFinal`
+- ✔ `BaseDeDatos_CienEscriturasParalelas_SinErroresDeBloqueo`
+- ✔ `Cincuenta_PaquetesDistintos_AlMismoTiempo_NingunoSePierde`
+- ✔ `DosNodos_DelegandoYEnviando_EnAmbasDirecciones`
+- ✔ `DoscientasOperacionesCripto_ConLaMismaLlave_EnParalelo`
+- ✔ `TreintaPeticionesCripto_Simultaneas_LimiteDe10_SinErroresRaros`
+- ✔ `VeinteClicsEnAceptar_AlMismoTiempo_SoloUnoGana`
+- ✔ `VeinticincoCopias_DelMismoPaquete_SoloSeRegistraUna_ElRestoEs409`

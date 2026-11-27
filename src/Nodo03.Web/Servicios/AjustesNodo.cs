@@ -7,10 +7,13 @@ namespace Nodo03.Web.Servicios;
 /// <summary>Valores que el usuario cambia desde la pantalla "Ajustes" (se guardan en la base).</summary>
 public sealed record ValoresAjustes
 {
-    /// <summary>Si es false, /api/status anuncia acceptingPackages=false y el receptor responde 503.</summary>
+    /// <summary>Si es false, /api/status anuncia acceptingPackages=false y la bandeja responde 503 E-BUSY.</summary>
     public bool AceptandoPaquetes { get; init; } = true;
 
-    /// <summary>Ping-pong automático: al llegar una pelota RSA/ECC para este nodo, se acepta, descifra, recifra y regresa sola.</summary>
+    /// <summary>
+    /// Ping-pong automático: al llegar una pelota RSA/ECC cuya llave (keyId) es de este nodo, se
+    /// acepta, se descifra (inverse), se vuelve a cifrar (forward) y se regresa sola al remitente.
+    /// </summary>
     public bool RebotarAutomatico { get; init; }
 
     /// <summary>Máximo de rebotes por rally, para que dos nodos automáticos no jueguen para siempre.</summary>
@@ -19,8 +22,8 @@ public sealed record ValoresAjustes
     /// <summary>Pausa entre recibir y regresar la pelota (ms), para que la demo se pueda seguir con la vista.</summary>
     public int PausaRebotesMs { get; init; } = 800;
 
-    /// <summary>Algoritmos que el usuario permite descifrar ("RSA", "ECC").</summary>
-    public string[] AlgoritmosHabilitados { get; init; } = [CodigosAlgoritmo.Rsa, CodigosAlgoritmo.Ecc];
+    /// <summary>Algoritmos propios que este nodo atiende como Proveedor ("RSA", "ECC").</summary>
+    public string[] AlgoritmosHabilitados { get; init; } = [Diccionario.Rsa, Diccionario.Ecc];
 
     /// <summary>Permitir administrar el nodo desde otra máquina de la LAN (ej. celular).</summary>
     public bool AdminRemoto { get; init; }
@@ -55,12 +58,13 @@ public sealed class AjustesNodo
             MaxRebotes = Math.Clamp(nuevos.MaxRebotes, 1, 50),
             PausaRebotesMs = Math.Clamp(nuevos.PausaRebotesMs, 0, 10_000),
             AlgoritmosHabilitados = nuevos.AlgoritmosHabilitados
-                .Where(CodigosAlgoritmo.LoImplementaEsteNodo).Distinct().ToArray(),
+                .Where(Diccionario.Implementados.Contains).Distinct().ToArray(),
         };
         _repo.GuardarAjuste(Clave, JsonSerializer.Serialize(nuevos));
         _actual = nuevos;
         return nuevos;
     }
 
-    public bool PuedeDescifrar(string codigo) => _actual.AlgoritmosHabilitados.Contains(codigo);
+    /// <summary>¿El usuario tiene habilitado este algoritmo propio?</summary>
+    public bool Habilitado(string codigo) => _actual.AlgoritmosHabilitados.Contains(codigo);
 }

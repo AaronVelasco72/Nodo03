@@ -7,3 +7,5 @@ datos/
 datos-*/
 src/Nodo03.Web/datos/
 TestResults/
+__pycache__/
+*.pyc

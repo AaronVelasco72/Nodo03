@@ -1,146 +1,138 @@
-using System.Text.Json;
-using Nodo03.Core.Cripto;
 using Nodo03.Core.Datos;
 using Nodo03.Core.Protocolo;
 using Nodo03.Core.Servicios;
 
 namespace Nodo03.Web.Servicios;
 
-/// <summary>Lo que el endpoint de recepción necesita para responder.</summary>
-public sealed record ResultadoRecepcion(
-    int CodigoHttp, string Mensaje, Solicitud? Solicitud, ResultadoValidacion? Validacion, bool Duplicado = false);
-
 /// <summary>
-/// MODO RECEPTOR: valida un .zip entrante y lo registra en la bandeja "Solicitudes".
+/// ROL RECEPTOR: valida un .zip entrante (sección 13.1) y lo registra en la bandeja Solicitudes.
 /// </summary>
 /// <remarks>
-/// <para>Implementa las 5 "Validaciones automáticas al recibir" de la sección 3.2:</para>
 /// <code>
-/// 1. ¿Es zip y no excede el límite?          no -> 400 / 413   (el 413 lo da el endpoint)
-/// 2. ¿Trae exactamente los 3 archivos?        no -> 400
-/// 3. ¿SHA-256 de datos.enc coincide?          no -> 422
-/// 4. ¿Firma X.509 válida?                     no -> 422
-/// 5. Registrar en Solicitudes como Pendiente  -> 202
+///  1  E-SIZE (413)            ← lo revisa el endpoint antes de leer el cuerpo
+///  2-5 E-ZIP-INVALID / E-ZIP-STRUCTURE / E-ZIP-BOMB / E-MANIFEST (400)   ← EmpaquetadorZip.Leer
+///  6-13 E-VERSION … E-TIMESTAMP (400/422)                                ← ValidadorPaquete.Validar
+///  confianza: fijado y otra huella → 403 E-CERT-UNTRUSTED
+///             no fijado → se acepta como "Remitente no confirmado"
+///  14 E-DUPLICATE (409)       ← índice UNIQUE de la base (también resuelve carreras)
+///  → 202 { packetId, status: "Pendiente", receivedAtUtc }
 /// </code>
-/// <para><b>Decisión de diseño:</b> los paquetes que fallan en 3 o 4 (422) también se guardan,
-/// pero directamente como <c>Rechazada</c> y con sello "Inválida", para que quede evidencia
-/// y el usuario vea el intento en la bandeja. Nunca llegan a "Pendiente".</para>
-///
-/// <para><b>Concurrencia:</b></para>
-/// <list type="bullet">
-///   <item>Un <see cref="SemaphoreSlim"/> limita cuántos paquetes se validan a la vez (2 × núcleos).
-///   Si llegan 200 al mismo tiempo, los demás esperan su turno en lugar de saturar la memoria.</item>
-///   <item>Los duplicados (mismo packetId) se resuelven con el índice UNIQUE de la base: aunque
-///   lleguen 20 copias simultáneas, solo una se inserta; las demás reciben 202 con
-///   <c>duplicate: true</c> (operación idempotente: reintentar es seguro).</item>
-/// </list>
+/// <para><b>Evidencia:</b> si el manifiesto se pudo leer pero falló una validación de 6 a 13 o la
+/// confianza, el zip se guarda en <c>invalidos/</c> y aparece en la bandeja como "Inválida"
+/// (Rechazada). Así el usuario ve el intento y el motivo.</para>
+/// <para><b>Concurrencia:</b> un <see cref="SemaphoreSlim"/> limita cuántos paquetes se
+/// validan a la vez (2 × núcleos); los demás esperan turno.</para>
 /// </remarks>
 public sealed class ServicioRecepcion(
-    RepositorioNodo repo, AlmacenPaquetes almacen, BusEventos bus, AjustesNodo ajustes,
-    IdentidadNodo identidad, MotorPingPong pingPong, ILogger<ServicioRecepcion> log)
+    RepositorioNodo repo, AlmacenPaquetes almacen, BusEventos bus, AjustesNodo ajustes, OpcionesNodo opciones,
+    ServicioDirectorio directorio, MotorPingPong pingPong, ILogger<ServicioRecepcion> log)
 {
-    private static readonly SemaphoreSlim Turnos = new(Environment.ProcessorCount * 2);
+    private readonly SemaphoreSlim Turnos = new(Environment.ProcessorCount * 2);
 
-    /// <summary>El detalle se guarda en camelCase, igual que lo entrega la API a la interfaz.</summary>
-    private static readonly JsonSerializerOptions JsonWeb = new(JsonSerializerDefaults.Web);
-
-    public async Task<ResultadoRecepcion> Recibir(byte[] zip, string nombreZip, string ipRemota, CancellationToken ct = default)
+    /// <summary>Procesa el paquete. Lanza <see cref="ErrorProtocolo"/> con el código del Anexo B.</summary>
+    public async Task<Solicitud> Recibir(byte[] zip, string nombreZip, string ipRemota, CancellationToken ct = default)
     {
         if (!ajustes.Actual.AceptandoPaquetes)
-            return new ResultadoRecepcion(503, "El nodo no está aceptando paquetes en este momento.", null, null);
+            throw new ErrorProtocolo("E-BUSY", $"{opciones.NodoId} no está aceptando paquetes en este momento.");
 
         await Turnos.WaitAsync(ct);
-        try
-        {
-            return Procesar(zip, nombreZip, ipRemota);
-        }
-        finally
-        {
-            Turnos.Release();
-        }
+        try { return Procesar(zip, nombreZip, ipRemota); }
+        finally { Turnos.Release(); }
     }
 
-    private ResultadoRecepcion Procesar(byte[] zip, string nombreZip, string ipRemota)
+    private Solicitud Procesar(byte[] zip, string nombreZip, string ipRemota)
     {
-        // ---- Pasos 1 y 2: estructura ----
-        PaqueteLeido paquete;
+        // ---- 2 a 5: zip y manifiesto ----
+        PaqueteLeido p;
+        try { p = EmpaquetadorZip.Leer(zip); }
+        catch (ErrorProtocolo e)
+        {
+            repo.Registrar("error", $"Paquete de {ipRemota} rechazado: {e.Codigo} {e.Message}");
+            bus.Publicar("error", new { mensaje = $"Paquete de {ipRemota} rechazado ({e.Codigo})", detalle = e.Message });
+            throw;
+        }
+        var m = p.Manifiesto;
+        var s = NuevaSolicitud(m, nombreZip, ipRemota);
+
+        // ---- 6 a 13 y confianza ----
         try
         {
-            paquete = EmpaquetadorZip.Leer(zip);
+            var info = ValidadorPaquete.Validar(p, DateTime.UtcNow);
+            s.Verificacion = directorio.ConfianzaDe(m.SourceNode, info.Huella);
+            s.Detalle = s.Verificacion == Verificaciones.NoConfirmado
+                ? $"Firma válida, pero {m.SourceNode} no está fijado en el directorio (confirma su huella en Nodos)."
+                : $"Firma de {m.SourceNode} verificada con la huella confirmada.";
         }
-        catch (PaqueteMalformadoException ex)
+        catch (ErrorProtocolo e)
         {
-            log.LogWarning("Paquete malformado de {Ip}: {Motivo}", ipRemota, ex.Message);
-            repo.Registrar("error", $"Paquete malformado de {ipRemota}: {ex.Message}");
-            bus.Publicar("error", new { mensaje = $"Paquete malformado de {ipRemota}", detalle = ex.Message });
-            return new ResultadoRecepcion(400, ex.Message, null, null);
+            // Evidencia en la bandeja como "Inválida" (Rechazada).
+            s.Verificacion = Verificaciones.Invalida;
+            s.Detalle = $"{e.Codigo}: {e.Message}";
+            s.Estado = EstadosSolicitud.Rechazada;
+            s.DecididoUtc = DateTime.UtcNow;
+            s.RutaZip = almacen.Guardar("invalidos", s.Id, s.NombreZip, zip);
+            repo.InsertarSolicitud(s);
+            Avisar(s, "rechazo-automatico");
+            throw;
         }
 
-        var m = paquete.Manifiesto;
+        // ---- 14: duplicado ----
+        if (repo.ExistePaquete(m.PacketId))
+            throw new ErrorProtocolo("E-DUPLICATE", $"El packetId {m.PacketId} ya se había recibido.");
+        s.RutaZip = almacen.Guardar("recibidos", s.Id, s.NombreZip, zip);
+        if (!repo.InsertarSolicitud(s))
+        {
+            // Otra copia idéntica ganó la carrera entre la consulta y el INSERT.
+            almacen.Borrar(s.RutaZip);
+            throw new ErrorProtocolo("E-DUPLICATE", $"El packetId {m.PacketId} ya se había recibido.");
+        }
+        Avisar(s, "recepcion");
 
-        // ¿Ya lo tenemos? (reintento del emisor). Respuesta idempotente.
-        if (repo.ObtenerSolicitudPorPaquete(m.PacketId) is { } existente)
-            return new ResultadoRecepcion(202, "Paquete ya recibido anteriormente.", existente, null, Duplicado: true);
+        // ¿Pelota de ping-pong que hay que regresar sola? Solo RSA/ECC: no necesitan secretos del
+        // usuario (la llave la guarda EQ03 con keyId), así que el rebote puede ser automático.
+        var a = ajustes.Actual;
+        if (a.RebotarAutomatico && Diccionario.Implementados.Contains(s.AlgoritmoCodigo)
+            && m.PacketType == TiposPaquete.Package && m.KeyRef is not null
+            && s.Salto < a.MaxRebotes && !string.IsNullOrWhiteSpace(s.DireccionRespuesta))
+            pingPong.Encolar(s.Id);
 
-        // ---- Pasos 3 y 4: integridad y firma ----
-        var validacion = ValidadorPaquete.Validar(paquete, nombreZip);
+        return s;
+    }
 
-        // ---- Paso 5: registrar ----
-        var s = new Solicitud
+    private static Solicitud NuevaSolicitud(Manifiesto m, string nombreZip, string ip)
+    {
+        var alg = Diccionario.PorCodigo(m.AlgorithmCode);
+        return new Solicitud
         {
             PacketId = m.PacketId,
             NombreZip = AlmacenPaquetes.NombreSeguro(nombreZip),
-            OrigenIp = ipRemota,
-            NodoOrigen = string.IsNullOrWhiteSpace(m.SourceNode) ? "desconocido" : m.SourceNode,
-            DireccionRespuesta = m.SourceIp ?? "",
-            AlgoritmoCodigo = m.AlgorithmCode ?? "",
-            Algoritmo = m.Algorithm ?? "",
-            Modo = ModosCarga.Normalizar(m.PayloadMode),
-            NombreOriginal = m.OriginalFileName ?? "",
+            OrigenIp = ip,
+            NodoOrigen = m.SourceNode,
+            NodoProductor = m.ProducerNode,
+            DireccionRespuesta = m.SourceIp,
+            AlgoritmoCodigo = m.AlgorithmCode,
+            AlgoritmoNombre = string.IsNullOrWhiteSpace(m.AlgorithmName) ? alg?.Nombre ?? "" : m.AlgorithmName,
+            Operacion = m.Operation,
+            OperacionNombre = string.IsNullOrWhiteSpace(m.OperationName) ? alg?.NombreOperacion(m.Operation) ?? "" : m.OperationName,
+            Modo = m.PayloadMode,
+            NombreOriginal = m.OriginalFileName,
             TamanoOriginal = m.OriginalSizeBytes,
-            Sha256 = validacion.Sha256Calculado,
-            Verificacion = validacion.Etiqueta,
-            DetalleJson = JsonSerializer.Serialize(validacion, JsonWeb),
-            Estado = validacion.Valido ? EstadosSolicitud.Pendiente : EstadosSolicitud.Rechazada,
-            DecididoUtc = validacion.Valido ? null : DateTime.UtcNow,
-            Salto = m.ParametroEntero(ServicioPaquetes.ParamSalto),
-            RallyId = m.Parametro(ServicioPaquetes.ParamRally) ?? m.PacketId,
+            Sha256 = m.EncryptedSha256,
+            Salto = int.TryParse(m.Parametro("hop"), out var h) ? h : 0,
+            RallyId = m.Parametro("rallyId") ?? m.PacketId,
         };
-        s.RutaZip = almacen.Guardar(validacion.Valido ? "recibidos" : "invalidos", s.Id, s.NombreZip, zip);
+    }
 
-        if (!repo.InsertarSolicitud(s))
-        {
-            // Otra petición idéntica ganó la carrera entre nuestra consulta y el INSERT.
-            almacen.Borrar(s.RutaZip);
-            return new ResultadoRecepcion(202, "Paquete ya recibido anteriormente.",
-                repo.ObtenerSolicitudPorPaquete(m.PacketId), null, Duplicado: true);
-        }
-
-        var resumen = $"{s.NodoOrigen} ({ipRemota}) envió {s.NombreZip} · {s.AlgoritmoCodigo} · {s.Verificacion}";
-        repo.Registrar(validacion.Valido ? "recepcion" : "rechazo-automatico", resumen, s.RallyId, s.Salto);
+    private void Avisar(Solicitud s, string tipo)
+    {
+        var resumen = $"{s.NodoOrigen} ({s.OrigenIp}) envió {s.NombreZip} · {s.AlgoritmoCodigo} {s.OperacionNombre} · {s.Verificacion}";
+        repo.Registrar(tipo, resumen, s.RallyId, s.Salto);
         bus.Publicar("solicitud", new
         {
-            id = s.Id, nodo = s.NodoOrigen, ip = ipRemota, zip = s.NombreZip, algoritmo = s.AlgoritmoCodigo,
-            verificacion = s.Verificacion, estado = s.Estado, salto = s.Salto, rallyId = s.RallyId,
-            pendientes = repo.ContarPendientes(),
+            id = s.Id, nodo = s.NodoOrigen, ip = s.OrigenIp, zip = s.NombreZip, algoritmo = s.AlgoritmoCodigo,
+            operacion = s.OperacionNombre, verificacion = s.Verificacion, estado = s.Estado, salto = s.Salto,
+            rallyId = s.RallyId, pendientes = repo.ContarPendientes(),
         });
-        log.LogInformation("Recibido {Zip} de {Ip}: {Etiqueta}", s.NombreZip, ipRemota, s.Verificacion);
-
-        if (!validacion.Valido)
-            return new ResultadoRecepcion(422, "Integridad o firma inválida: " + string.Join(" ", validacion.Errores), s, validacion);
-
-        // ¿Pelota de ping-pong que hay que regresar sola?
-        var a = ajustes.Actual;
-        if (a.RebotarAutomatico
-            && CodigosAlgoritmo.LoImplementaEsteNodo(s.AlgoritmoCodigo)
-            && ajustes.PuedeDescifrar(s.AlgoritmoCodigo)
-            && identidad.EsMiHuella(m.Parametro("recipientThumbprintSha256"))
-            && s.Salto < a.MaxRebotes
-            && !string.IsNullOrWhiteSpace(s.DireccionRespuesta))
-        {
-            pingPong.Encolar(s.Id);
-        }
-
-        return new ResultadoRecepcion(202, "Solicitud recibida; pendiente de aprobación.", s, validacion);
+        log.LogInformation("Bandeja: {Resumen}", resumen);
     }
 }

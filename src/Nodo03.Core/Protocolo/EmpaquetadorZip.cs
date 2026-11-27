@@ -4,150 +4,130 @@ using System.Text;
 namespace Nodo03.Core.Protocolo;
 
 /// <summary>
-/// Arma y abre el .zip del estándar (sección 2): EXACTAMENTE tres archivos en la raíz.
-/// </summary>
-/// <remarks>
+/// Arma y abre los .zip de la sección 9 del estándar v2.0.
 /// <code>
-/// NODO03_RSA_20261124_201500_9F86D081.zip
-///  ├── datos.enc        contenido cifrado (binario)
-///  ├── certificado.pem  certificado X.509 público del emisor
-///  └── manifest.json    metadatos + huellas + firma
+/// package: datos.enc     + certificado.pem + manifest.json
+/// result:  resultado.enc + certificado.pem + manifest.json
 /// </code>
-/// <para><b>Seguridad al abrir zips ajenos:</b></para>
-/// <list type="bullet">
-///   <item>Solo se aceptan esos tres nombres exactos: así es imposible un ataque
-///   "zip slip" (rutas como <c>../../windows/system32/x.dll</c>).</item>
-///   <item>Se limita el tamaño DESCOMPRIMIDO de cada archivo y se lee con tope, para que una
-///   "bomba zip" (pocos KB que se inflan a GB) no tumbe el nodo.</item>
-///   <item>Nunca se escribe nada del zip en disco durante la validación: todo es en memoria.</item>
-/// </list>
-/// </remarks>
+/// Al abrir aplica las validaciones 2–5 de la sección 13.1 (zip válido, estructura, bomba zip y
+/// formato del manifiesto) y lanza <see cref="ErrorProtocolo"/> con el código del Anexo B.
+/// </summary>
 public static class EmpaquetadorZip
 {
-    public const string ArchivoDatos = "datos.enc";
-    public const string ArchivoCertificado = "certificado.pem";
-    public const string ArchivoManifiesto = "manifest.json";
+    public const string Datos = "datos.enc";
+    public const string Resultado = "resultado.enc";
+    public const string Certificado = "certificado.pem";
+    public const string ManifiestoJson = "manifest.json";
 
-    /// <summary>Los tres nombres obligatorios.</summary>
-    public static readonly string[] Obligatorios = [ArchivoDatos, ArchivoCertificado, ArchivoManifiesto];
+    public const long MaxDescomprimido = 200L * 1024 * 1024; // 13.1 paso 4
+    public const double MaxRazonCompresion = 100;            // 100:1
+    public const int MaxPartes = 64;                         // 9.4
 
-    /// <summary>Crea el .zip en memoria con los tres archivos.</summary>
-    public static byte[] Crear(byte[] datosEnc, string certificadoPem, Manifiesto manifiesto)
+    /// <summary>Crea el zip con los 3 archivos.</summary>
+    public static byte[] Crear(byte[] datos, string certificadoPem, Manifiesto m)
     {
-        using var memoria = new MemoryStream();
-        using (var zip = new ZipArchive(memoria, ZipArchiveMode.Create, leaveOpen: true))
+        var nombreDatos = m.PacketType == TiposPaquete.Result ? Resultado : Datos;
+        using var ms = new MemoryStream();
+        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true, entryNameEncoding: Encoding.UTF8))
         {
-            // datos.enc ya está cifrado (parece ruido aleatorio): comprimirlo no ahorra nada.
-            Escribir(zip, ArchivoDatos, datosEnc, CompressionLevel.NoCompression);
-            Escribir(zip, ArchivoCertificado, Encoding.ASCII.GetBytes(certificadoPem), CompressionLevel.Optimal);
-            Escribir(zip, ArchivoManifiesto, manifiesto.ABytes(), CompressionLevel.Optimal);
+            Agregar(zip, nombreDatos, datos, CompressionLevel.NoCompression); // ya cifrado: comprimir no ahorra
+            Agregar(zip, Certificado, Encoding.ASCII.GetBytes(certificadoPem), CompressionLevel.Optimal);
+            Agregar(zip, ManifiestoJson, m.ABytes(), CompressionLevel.Optimal);
         }
-        return memoria.ToArray();
+        return ms.ToArray();
     }
 
-    private static void Escribir(ZipArchive zip, string nombre, byte[] contenido, CompressionLevel nivel)
+    private static void Agregar(ZipArchive zip, string nombre, byte[] contenido, CompressionLevel nivel)
     {
-        var entrada = zip.CreateEntry(nombre, nivel);
-        // Fecha fija en UTC del momento: no afecta la firma, solo es informativa.
-        entrada.LastWriteTime = DateTimeOffset.UtcNow;
-        using var s = entrada.Open();
+        using var s = zip.CreateEntry(nombre, nivel).Open();
         s.Write(contenido);
     }
 
-    /// <summary>
-    /// Abre un .zip recibido y valida su ESTRUCTURA (no la criptografía; eso lo hace
-    /// <see cref="ValidadorPaquete"/>).
-    /// </summary>
-    /// <param name="zipBytes">Bytes del archivo recibido.</param>
-    /// <param name="maxBytesPorArchivo">Tope descomprimido por archivo (defensa anti bomba zip).</param>
-    /// <exception cref="PaqueteMalformadoException">Si no cumple el estándar (=> HTTP 400).</exception>
-    public static PaqueteLeido Leer(byte[] zipBytes, long maxBytesPorArchivo = 64L * 1024 * 1024)
+    /// <summary>Abre y valida la estructura. No verifica criptografía (eso es <see cref="ValidadorPaquete"/>).</summary>
+    public static PaqueteLeido Leer(byte[] zipBytes)
     {
         ZipArchive zip;
-        try
-        {
-            zip = new ZipArchive(new MemoryStream(zipBytes, writable: false), ZipArchiveMode.Read);
-        }
+        try { zip = new ZipArchive(new MemoryStream(zipBytes, writable: false), ZipArchiveMode.Read, false, Encoding.UTF8); }
         catch (Exception ex) when (ex is InvalidDataException or ArgumentException or IOException)
-        {
-            throw new PaqueteMalformadoException("El archivo recibido no es un .zip válido.");
-        }
+        { throw new ErrorProtocolo("E-ZIP-INVALID", "El cuerpo recibido no es un .zip válido."); }
 
         using (zip)
         {
-            var nombres = zip.Entries.Select(e => e.FullName).ToList();
+            var entradas = zip.Entries.ToList();
+            var nombres = entradas.Select(e => e.FullName).ToList();
 
-            // Regla: exactamente 3 archivos en la raíz, sin carpetas.
-            var conCarpeta = nombres.Where(n => n.Contains('/') || n.Contains('\\')).ToList();
-            if (conCarpeta.Count > 0)
-                throw new PaqueteMalformadoException(
-                    $"El .zip no debe tener subcarpetas (se encontró: {string.Join(", ", conCarpeta)}).");
+            // Paso 3: exactamente 3 entradas planas con los nombres exactos.
+            if (nombres.Any(n => n.Contains('/') || n.Contains('\\') || n.Contains("..") || n.StartsWith('.')))
+                throw new ErrorProtocolo("E-ZIP-STRUCTURE", "El zip contiene carpetas, rutas o archivos ocultos: " + string.Join(", ", nombres));
+            var esResultado = nombres.Contains(Resultado);
+            var esperados = new[] { esResultado ? Resultado : Datos, Certificado, ManifiestoJson };
+            if (nombres.Count != 3 || esperados.Except(nombres, StringComparer.Ordinal).Any())
+                throw new ErrorProtocolo("E-ZIP-STRUCTURE",
+                    $"Se esperaban exactamente {string.Join(", ", esperados)}; el zip trae: {string.Join(", ", nombres)}.");
 
-            var faltantes = Obligatorios.Except(nombres, StringComparer.Ordinal).ToList();
-            if (faltantes.Count > 0)
-                throw new PaqueteMalformadoException($"Falta(n) en el .zip: {string.Join(", ", faltantes)}.");
+            // Paso 4: bomba zip.
+            long total = entradas.Sum(e => e.Length), comprimido = entradas.Sum(e => e.CompressedLength);
+            if (total > MaxDescomprimido || (comprimido > 0 && (double)total / comprimido > MaxRazonCompresion))
+                throw new ErrorProtocolo("E-ZIP-BOMB", $"Descomprimido {total} bytes con razón {(double)total / Math.Max(1, comprimido):0.#}:1.");
 
-            var sobrantes = nombres.Except(Obligatorios, StringComparer.Ordinal).ToList();
-            if (sobrantes.Count > 0 || nombres.Count != 3)
-                throw new PaqueteMalformadoException(
-                    $"El .zip debe contener exactamente 3 archivos; sobran: {string.Join(", ", sobrantes)}.");
-
-            byte[] LeerEntrada(string nombre)
+            byte[] Leer(string nombre)
             {
                 var e = zip.GetEntry(nombre)!;
-                if (e.Length > maxBytesPorArchivo)
-                    throw new PaqueteMalformadoException($"{nombre} excede el tamaño permitido.");
-                using var s = e.Open();
-                using var destino = new MemoryStream();
-                // Copia con tope: no confiamos en el tamaño declarado en el encabezado del zip.
-                var buffer = new byte[81920];
-                int leidos;
-                long total = 0;
-                while ((leidos = s.Read(buffer, 0, buffer.Length)) > 0)
+                try
                 {
-                    total += leidos;
-                    if (total > maxBytesPorArchivo)
-                        throw new PaqueteMalformadoException($"{nombre} excede el tamaño permitido.");
-                    destino.Write(buffer, 0, leidos);
+                    using var s = e.Open();
+                    using var destino = new MemoryStream();
+                    var buffer = new byte[81920];
+                    int n; long leidos = 0;
+                    while ((n = s.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        leidos += n;
+                        if (leidos > e.Length || leidos > MaxDescomprimido) // no confiamos en el encabezado
+                            throw new ErrorProtocolo("E-ZIP-BOMB", $"{nombre} se infla más de lo declarado.");
+                        destino.Write(buffer, 0, n);
+                    }
+                    return destino.ToArray();
                 }
-                return destino.ToArray();
+                catch (InvalidDataException) { throw new ErrorProtocolo("E-ZIP-INVALID", $"No se pudo descomprimir {nombre} (¿zip dañado o con contraseña?)."); }
             }
 
-            byte[] datos, cert, json;
-            try
-            {
-                datos = LeerEntrada(ArchivoDatos);
-                cert = LeerEntrada(ArchivoCertificado);
-                json = LeerEntrada(ArchivoManifiesto);
-            }
-            catch (InvalidDataException)
-            {
-                throw new PaqueteMalformadoException("El .zip está dañado (no se pudo descomprimir).");
-            }
+            var datos = Leer(esperados[0]);
+            var cert = Leer(Certificado);
+            var json = Leer(ManifiestoJson);
 
-            var manifiesto = Manifiesto.DesdeBytes(json);
-            ValidarCamposObligatorios(manifiesto);
-            return new PaqueteLeido(datos, cert, json, manifiesto);
+            // Paso 5: formato del manifiesto.
+            var m = Manifiesto.Leer(json);
+            if ((m.PacketType == TiposPaquete.Result) != esResultado)
+                throw new ErrorProtocolo("E-MANIFEST", $"packetType '{m.PacketType}' no corresponde al archivo {esperados[0]}.");
+            return new PaqueteLeido(datos, cert, json, m);
         }
     }
 
-    /// <summary>Campos sin los cuales no se puede ni verificar el paquete (=> 400).</summary>
-    private static void ValidarCamposObligatorios(Manifiesto m)
+    /// <summary>Lee las partes de un datos.enc multiparte (9.4): zip interno plano, máx. 64 entradas.</summary>
+    public static List<(string Nombre, byte[] Bytes)> LeerPartes(byte[] datos)
     {
-        var faltan = new List<string>();
-        if (string.IsNullOrWhiteSpace(m.PacketId)) faltan.Add("packetId");
-        if (string.IsNullOrWhiteSpace(m.TimestampUtc)) faltan.Add("timestampUtc");
-        if (string.IsNullOrWhiteSpace(m.EncryptedSha256)) faltan.Add("encryptedSha256");
-        if (string.IsNullOrWhiteSpace(m.CertificateThumbprintSha256)) faltan.Add("certificateThumbprintSha256");
-        if (string.IsNullOrWhiteSpace(m.ManifestSignatureBase64)) faltan.Add("manifestSignatureBase64");
-        if (faltan.Count > 0)
-            throw new PaqueteMalformadoException($"manifest.json incompleto, falta: {string.Join(", ", faltan)}.");
+        try
+        {
+            using var zip = new ZipArchive(new MemoryStream(datos, false), ZipArchiveMode.Read);
+            if (zip.Entries.Count > MaxPartes) throw new ErrorProtocolo("E-ZIP-STRUCTURE", "El zip interno tiene más de 64 partes.");
+            if (zip.Entries.Sum(e => e.Length) > MaxDescomprimido) throw new ErrorProtocolo("E-ZIP-BOMB", "Zip interno demasiado grande.");
+            return zip.Entries.Select(e =>
+            {
+                if (e.FullName.Contains('/') || e.FullName.Contains('\\') || e.FullName.Contains(".."))
+                    throw new ErrorProtocolo("E-ZIP-STRUCTURE", "El zip interno tiene rutas.");
+                using var s = e.Open();
+                using var ms = new MemoryStream();
+                s.CopyTo(ms);
+                return (e.FullName, ms.ToArray());
+            }).ToList();
+        }
+        catch (InvalidDataException) { throw new ErrorProtocolo("E-ZIP-STRUCTURE", "datos.enc multiparte no es un zip válido."); }
     }
 }
 
-/// <summary>Contenido de un .zip ya abierto y con estructura correcta.</summary>
-/// <param name="DatosEnc">Bytes de datos.enc.</param>
-/// <param name="CertificadoPem">Bytes de certificado.pem.</param>
-/// <param name="ManifiestoJson">Bytes originales de manifest.json (se guardan tal cual).</param>
-/// <param name="Manifiesto">manifest.json ya interpretado.</param>
-public sealed record PaqueteLeido(byte[] DatosEnc, byte[] CertificadoPem, byte[] ManifiestoJson, Manifiesto Manifiesto);
+/// <summary>Contenido de un zip ya abierto.</summary>
+/// <param name="Datos">datos.enc o resultado.enc.</param>
+/// <param name="CertificadoPem">certificado.pem.</param>
+/// <param name="ManifiestoJson">Bytes originales de manifest.json.</param>
+/// <param name="Manifiesto">Manifiesto interpretado.</param>
+public sealed record PaqueteLeido(byte[] Datos, byte[] CertificadoPem, byte[] ManifiestoJson, Manifiesto Manifiesto);
